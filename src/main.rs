@@ -241,10 +241,16 @@ fn configure_engine(engine: &mut CognitiveEngine, a: &Args) -> Result<()> {
 }
 
 fn load_engine(a: &Args) -> Result<(CognitiveEngine, Meta)> {
-    let ckpt = a.get("ckpt", "model.safetensors");
-    let meta = Meta::load(&ckpt)?;
+    load_engine_from(a, &a.get("ckpt", "model.safetensors"))
+}
+
+/// The shipped browsing agent, used by `agent` / `agent-eval` when no `--ckpt` is given.
+const SHIPPED_AGENT: &str = "models/browser_agent.safetensors";
+
+fn load_engine_from(a: &Args, ckpt: &str) -> Result<(CognitiveEngine, Meta)> {
+    let meta = Meta::load(ckpt)?;
     let model = CogModel::new(meta.config()?, &Device::Cpu)?;
-    model.load(&ckpt)?;
+    model.load(ckpt)?;
     let mut engine = CognitiveEngine::from_model(&model)?;
     configure_engine(&mut engine, a)?;
     Ok((engine, meta))
@@ -515,7 +521,7 @@ fn agent_policy(a: &Args, trace: bool) -> Result<Box<dyn Policy>> {
     match a.get("policy", "model").as_str() {
         "expert" => Ok(Box::new(ExpertPolicy)),
         "model" => {
-            let (engine, meta) = load_engine(a)?;
+            let (engine, meta) = load_engine_from(a, &a.get("ckpt", SHIPPED_AGENT))?;
             if meta.task != Task::Browser {
                 bail!("the checkpoint was trained on '{}', not 'browser' (train with --task browser)", meta.task.name())
             }

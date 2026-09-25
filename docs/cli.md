@@ -141,7 +141,7 @@ printf '3 1 4 1 5 9 2 6\n' | nc 127.0.0.1 7878
 | `--tree <B>` | ширина луча латентного дерева гипотез; `0` — без дерева |
 | `--iters <n>` | итераций MPPI; `0` — план из дерева или роллаута политики |
 | `--solver`, `--ode-steps` | решатель ODE декодера |
-| `--decoder flow\|probe\|probe-start\|probe-vote` | декодер действия (см. `decoder` в [configuration.md](configuration.md)) |
+| `--decoder flow\|probe\|probe-start\|probe-vote\|probe-consensus` | декодер действия (см. `decoder` в [configuration.md](configuration.md)); у агента по умолчанию `probe-consensus` |
 
 ### `tokenizer`
 
@@ -177,6 +177,7 @@ cog_engine agent --ckpt agent.safetensors --question "Сколько будет 
 
 | Флаг | По умолчанию | Смысл |
 |---|---|---|
+| `--ckpt` | `models/browser_agent.safetensors` | чекпойнт агента (по умолчанию — поставляемая модель) |
 | `--question` | `Сколько стоит лампа?` | вопрос на русском; если он совпадает с одним из шаблонов (с точностью до регистра, «ё» и знаков) или это арифметический пример, ответ проверяется |
 | `--world` | 42 | номер мира песочницы (от него зависят все факты) |
 | `--browser` | `chrome` | `chrome` — настоящий Chromium, `sim` — симулятор |

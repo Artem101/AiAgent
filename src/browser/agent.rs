@@ -62,11 +62,15 @@ pub struct EnginePolicy {
     /// Record the full reasoning trace of every decision (allocates; for inspection).
     trace: bool,
     reasoning: Option<Reasoning>,
+    /// The previous observation and action, and the actions that left this observation
+    /// unchanged (not repeated: the agent takes its next hypothesis instead).
+    previous: Option<(Vec<u32>, Option<Action>)>,
+    no_effect: Vec<Action>,
 }
 
 impl EnginePolicy {
     pub fn new(engine: CognitiveEngine) -> Self {
-        Self { engine, seed: 0, last: None, trace: false, reasoning: None }
+        Self { engine, seed: 0, last: None, trace: false, reasoning: None, previous: None, no_effect: Vec::new() }
     }
 
     /// Also keep the decoded tree of hypotheses and chain of thoughts of each decision.
@@ -88,15 +92,23 @@ impl Policy for EnginePolicy {
         let (mut out, g) = self.engine.generate(observation, self.seed)?;
         self.last = Some(g);
         self.reasoning = if self.trace { Some(self.engine.last_reasoning(g.plan)?) } else { None };
-        // The thoughts proposed alternatives: if the winner is not a well-formed action, act on
-        // the best proposal that is (hypotheses that decode into nonsense are pruned).
-        if self.engine.decoder() == ActionDecoder::ProbeConsensus && Action::decode(&out, text::ru()).is_none() {
-            let valid =
-                self.engine.ranked_proposals().into_iter().find(|(_, p)| Action::decode(p, text::ru()).is_some());
-            if let Some((_, p)) = valid {
+        // An action after which the agent sees exactly the same observation had no effect (a
+        // click on a missing element, retyping the same query): it is not repeated.
+        match self.previous.take() {
+            Some((obs, Some(action))) if obs == observation => self.no_effect.push(action),
+            Some((obs, _)) if obs == observation => {}
+            _ => self.no_effect.clear(),
+        }
+        // The thoughts proposed alternatives: if the winner is not a well-formed action, or one
+        // that had no effect here, act on the best proposal that is well-formed and new
+        // (hypotheses that decode into nonsense or into a dead end are pruned).
+        let usable = |t: &[u32]| Action::decode(t, text::ru()).filter(|a| !self.no_effect.contains(a));
+        if self.engine.decoder() == ActionDecoder::ProbeConsensus && usable(&out).is_none() {
+            if let Some((_, p)) = self.engine.ranked_proposals().into_iter().find(|(_, p)| usable(p).is_some()) {
                 out = p;
             }
         }
+        self.previous = Some((observation.to_vec(), Action::decode(&out, text::ru())));
         Ok(out)
     }
 
