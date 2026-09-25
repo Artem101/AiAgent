@@ -42,7 +42,7 @@ pub mod world;
 
 use candle_core::Result;
 
-use crate::config::{EngineConfig, PlannerKind};
+use crate::config::{ActionDecoder, EngineConfig, PlannerKind};
 
 pub use action::{Action, ACTION_LEN};
 pub use agent::{run_episode, EnginePolicy, Episode, ExpertPolicy, Policy};
@@ -95,6 +95,10 @@ pub fn engine_config(preset: &str) -> Result<EngineConfig> {
     cfg.planner.tree_beam = TREE_BEAM;
     cfg.planner.tree_branch = TREE_BRANCH;
     cfg.planner.kind = PlannerKind::MppiThenGradient;
+    // Actions are read from the thoughts: the whole action proposed by the thought that all
+    // thoughts of the plan and the surviving hypotheses agree on most (see `EnginePolicy`,
+    // which falls back to the best well-formed proposal).
+    cfg.decoder = ActionDecoder::ProbeConsensus;
     Ok(cfg)
 }
 

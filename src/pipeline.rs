@@ -108,6 +108,9 @@ pub struct CognitiveEngine {
     /// `[L, d_token]` scratch of the probe decoder and `[L, vocab]` vote accumulator.
     probe_emb: Box<[f32]>,
     vote: Box<[f32]>,
+    /// Proposals `[thoughts, L]` and their scores for [`ActionDecoder::ProbeConsensus`].
+    proposals: Box<[u32]>,
+    proposal_scores: Box<[f32]>,
     decoder: ActionDecoder,
     tokens: Box<[u32]>,
     memory: MemoryReport,
@@ -162,6 +165,8 @@ impl CognitiveEngine {
             logits: arena.host(cfg.answer_len() * cfg.vocab_size),
             probe_emb: arena.host(if probe.is_some() { cfg.answer_len() * cfg.flow.d_token } else { 0 }),
             vote: arena.host(if probe.is_some() { cfg.answer_len() * cfg.vocab_size } else { 0 }),
+            proposals: arena.host_u32(Self::max_thoughts(&cfg) * cfg.answer_len()),
+            proposal_scores: arena.host(Self::max_thoughts(&cfg)),
             decoder: cfg.decoder,
             tokens: arena.host_u32(cfg.answer_len()),
             gradient: GradientPlanner {
@@ -218,8 +223,16 @@ impl CognitiveEngine {
     pub fn set_tree(&mut self, beam: usize) -> Result<()> {
         self.cfg.planner.tree_beam = beam;
         self.planner.config.tree_beam = beam;
-        self.mppi_ws = self.planner.workspace(&mut Arena::new(&Device::Cpu))?;
+        let mut arena = Arena::new(&Device::Cpu);
+        self.mppi_ws = self.planner.workspace(&mut arena)?;
+        self.proposals = arena.host_u32(Self::max_thoughts(&self.cfg) * self.cfg.answer_len());
+        self.proposal_scores = arena.host(Self::max_thoughts(&self.cfg));
         Ok(())
+    }
+
+    /// Thoughts a decision can consult: the plan `s_0 … s_H` and the surviving tree leaves.
+    fn max_thoughts(cfg: &EngineConfig) -> usize {
+        cfg.plan_len() + cfg.planner.tree_beam
     }
 
     /// Enables/disables the policy warm start (zero-action warm start when off).
@@ -401,6 +414,63 @@ impl CognitiveEngine {
         Ok(())
     }
 
+    /// Stage 3 by sequence-level self-consistency (see [`ActionDecoder::ProbeConsensus`]); no
+    /// allocation.
+    fn decode_consensus(&mut self, out: &mut [u32]) -> Result<()> {
+        let Some(probe) = &self.probe else { bail!("no thought probe") };
+        let (ds, h, l) = (self.cfg.jepa.d_state, self.cfg.jepa.horizon, self.cfg.answer_len());
+        let Self { probe_emb, head, logits, mppi_ws, copy, copy_scratch, ttt_ws, proposals, proposal_scores, .. } =
+            self;
+        let memory = ttt_ws.copy_memory();
+        let v = head.vocab();
+        // pass 1: every thought proposes its action; pass 2: every thought scores every proposal
+        proposal_scores.fill(0.0);
+        for pass in 0..2 {
+            let mut n = 0;
+            let mut visit = |state: &[f32]| {
+                Self::probe_logp(probe, head, copy.as_ref(), memory, copy_scratch, state, probe_emb, logits);
+                if pass == 0 {
+                    Self::argmax_rows(logits, v, &mut proposals[n * l..(n + 1) * l]);
+                    n += 1;
+                } else {
+                    for (score, prop) in proposal_scores.iter_mut().zip(proposals.chunks_exact(l)) {
+                        *score += prop.iter().enumerate().map(|(i, &t)| logits[i * v + t as usize]).sum::<f32>();
+                    }
+                }
+            };
+            host_read(&mppi_ws.plan, |plan| plan.chunks_exact(ds).for_each(&mut visit))?;
+            for (_, traj) in mppi_ws.hypotheses() {
+                visit(&traj[h * ds..]);
+            }
+            if pass == 0 {
+                // proposals that were not made this time (fewer leaves) must not win
+                proposal_scores[n..].fill(f32::NEG_INFINITY);
+            }
+        }
+        let best = proposal_scores
+            .iter()
+            .enumerate()
+            .fold((0, f32::NEG_INFINITY), |b, (i, &x)| if x > b.1 { (i, x) } else { b })
+            .0;
+        out.copy_from_slice(&proposals[best * l..(best + 1) * l]);
+        Ok(())
+    }
+
+    /// Proposals of the last [`ActionDecoder::ProbeConsensus`] decision, best first and without
+    /// duplicates: `(summed log-probability over all thoughts, tokens)` (allocates). A caller
+    /// that knows its output grammar can take the best *valid* proposal instead of the best one.
+    pub fn ranked_proposals(&self) -> Vec<(f32, Vec<u32>)> {
+        let l = self.cfg.answer_len();
+        let mut out: Vec<(f32, Vec<u32>)> = Vec::new();
+        for (&score, prop) in self.proposal_scores.iter().zip(self.proposals.chunks_exact(l)) {
+            if score.is_finite() && !out.iter().any(|(_, p)| p == prop) {
+                out.push((score, prop.to_vec()));
+            }
+        }
+        out.sort_by(|a, b| b.0.total_cmp(&a.0));
+        out
+    }
+
     /// Full pipeline into a caller-provided buffer (`out.len() == answer_len`).
     pub fn generate_into(&mut self, prompt: &[u32], seed: u64, out: &mut [u32]) -> Result<Generation> {
         let t0 = Instant::now();
@@ -413,6 +483,7 @@ impl CognitiveEngine {
             ActionDecoder::Probe => self.decode_probe(self.cfg.jepa.horizon, out)?,
             ActionDecoder::ProbeStart => self.decode_probe(0, out)?,
             ActionDecoder::ProbeVote => self.decode_vote(out)?,
+            ActionDecoder::ProbeConsensus => self.decode_consensus(out)?,
         }
         let t3 = Instant::now();
         Ok(Generation {

@@ -88,15 +88,16 @@ fn state(rng: &mut Rng, world: &World, spec: &Spec) -> (String, Option<String>) 
     match *spec {
         Spec::Lookup { item, .. } => {
             let name = ITEMS[item].nom.to_string();
+            // «query typed, now submit» is the state models got stuck in: sample it often
             let typed = |rng: &mut Rng| match rng.uniform() {
-                x if x < 0.5 => None,
+                x if x < 0.35 => None,
                 x if x < 0.8 => Some(name.clone()),
                 _ => Some(wrong_text(rng, &[item])),
             };
-            if u < 0.2 {
+            if u < 0.3 {
                 let t = typed(rng);
                 (home, t)
-            } else if u < 0.5 {
+            } else if u < 0.55 {
                 let q = match rng.uniform() {
                     x if x < 0.6 => name.clone(),
                     x if x < 0.7 => ITEMS[item].gen.to_string(), // stem search still finds it
@@ -104,10 +105,10 @@ fn state(rng: &mut Rng, world: &World, spec: &Spec) -> (String, Option<String>) 
                 };
                 let t = if rng.uniform() < 0.2 { typed(rng) } else { None };
                 (results(&q), t)
-            } else if u < 0.85 {
+            } else if u < 0.87 {
                 let i = if rng.uniform() < 0.75 { item } else { other_item(rng, &[item]) };
                 (item_page(i), None)
-            } else if u < 0.95 {
+            } else if u < 0.96 {
                 (catalog(1 + rng.below(CATALOG_PAGES)), None)
             } else {
                 (format!("/w/{seed}/item/404"), None)
@@ -116,11 +117,11 @@ fn state(rng: &mut Rng, world: &World, spec: &Spec) -> (String, Option<String>) 
         Spec::Compare { a, b, .. } => {
             let query = format!("{} {}", ITEMS[a].nom, ITEMS[b].nom);
             let partial = |rng: &mut Rng| ITEMS[if rng.uniform() < 0.5 { a } else { b }].nom.to_string();
-            if u < 0.25 {
+            if u < 0.3 {
                 let t = match rng.uniform() {
-                    x if x < 0.4 => None,
-                    x if x < 0.7 => Some(query.clone()),
-                    x if x < 0.85 => Some(partial(rng)),
+                    x if x < 0.3 => None,
+                    x if x < 0.75 => Some(query.clone()),
+                    x if x < 0.875 => Some(partial(rng)),
                     _ => Some(wrong_text(rng, &[a, b])),
                 };
                 (home, t)
@@ -160,9 +161,9 @@ fn state(rng: &mut Rng, world: &World, spec: &Spec) -> (String, Option<String>) 
         }
         Spec::Total { a, b, .. } => {
             let query = format!("{} {}", ITEMS[a].nom, ITEMS[b].nom);
-            if u < 0.2 {
+            if u < 0.3 {
                 let t = match rng.uniform() {
-                    x if x < 0.5 => None,
+                    x if x < 0.35 => None,
                     x if x < 0.8 => Some(query.clone()),
                     _ => Some(wrong_text(rng, &[a, b])),
                 };

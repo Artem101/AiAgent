@@ -13,7 +13,7 @@ use super::obs::{self, Note, OBS_LEN};
 use super::world::{self, World};
 use super::{data, expert, Browser, PageSnapshot, Role};
 use crate::kernels::rng::Rng;
-use crate::pipeline::{CognitiveEngine, Generation, Reasoning};
+use crate::pipeline::{ActionDecoder, CognitiveEngine, Generation, Reasoning};
 use crate::text;
 use crate::tools::Calculator;
 
@@ -85,9 +85,18 @@ impl Policy for EnginePolicy {
         _note: Option<&Note>,
     ) -> Result<Vec<u32>> {
         self.seed += 1;
-        let (out, g) = self.engine.generate(observation, self.seed)?;
+        let (mut out, g) = self.engine.generate(observation, self.seed)?;
         self.last = Some(g);
         self.reasoning = if self.trace { Some(self.engine.last_reasoning(g.plan)?) } else { None };
+        // The thoughts proposed alternatives: if the winner is not a well-formed action, act on
+        // the best proposal that is (hypotheses that decode into nonsense are pruned).
+        if self.engine.decoder() == ActionDecoder::ProbeConsensus && Action::decode(&out, text::ru()).is_none() {
+            let valid =
+                self.engine.ranked_proposals().into_iter().find(|(_, p)| Action::decode(p, text::ru()).is_some());
+            if let Some((_, p)) = valid {
+                out = p;
+            }
+        }
         Ok(out)
     }
 

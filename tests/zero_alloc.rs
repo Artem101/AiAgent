@@ -103,7 +103,9 @@ fn check_hot_loops(model: &CogModel, label: &str) -> Result<()> {
     // Decoding the plan with the thought probe (single state or self-consistency vote).
     if model.jepa.probe.is_some() {
         use cog_engine::pipeline::ActionDecoder;
-        for d in [ActionDecoder::Probe, ActionDecoder::ProbeStart, ActionDecoder::ProbeVote] {
+        for d in
+            [ActionDecoder::Probe, ActionDecoder::ProbeStart, ActionDecoder::ProbeVote, ActionDecoder::ProbeConsensus]
+        {
             engine.set_decoder(d)?;
             engine.generate_into(&prompt, 0, &mut out)?; // warm-up
             let (r, n) = count(|| engine.generate_into(&prompt, 2, &mut out));

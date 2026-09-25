@@ -150,6 +150,11 @@ pub enum ActionDecoder {
     /// log-probability over every thought of the chosen plan `s_0 … s_H` and the terminal
     /// thoughts of the surviving tree hypotheses.
     ProbeVote,
+    /// Sequence-level self-consistency over the same thoughts: every thought proposes its whole
+    /// action (per-position argmax), and the proposal with the highest log-probability summed
+    /// over all thoughts wins. Unlike the per-position vote it never splices the verb of one
+    /// thought with the text of another.
+    ProbeConsensus,
 }
 
 impl ActionDecoder {
@@ -159,7 +164,8 @@ impl ActionDecoder {
             "probe" => Ok(Self::Probe),
             "probe-start" => Ok(Self::ProbeStart),
             "probe-vote" => Ok(Self::ProbeVote),
-            other => bail!("unknown decoder '{other}' (flow | probe | probe-start | probe-vote)"),
+            "probe-consensus" => Ok(Self::ProbeConsensus),
+            other => bail!("unknown decoder '{other}' (flow | probe | probe-start | probe-vote | probe-consensus)"),
         }
     }
 }
