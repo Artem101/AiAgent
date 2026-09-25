@@ -5,6 +5,7 @@ edition = "2021"
 rust-version = "1.87"
 description = "Hybrid non-autoregressive cognitive engine: TTT encoder + JEPA latent planner + continuous flow-matching decoder"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/Artem101/AiAgent"
 
 [features]
 default = []

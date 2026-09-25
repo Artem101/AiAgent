@@ -21,7 +21,7 @@
 ## Быстрый старт
 
 ```bash
-cd cog_engine
+git clone https://github.com/Artem101/AiAgent.git && cd AiAgent
 cargo run --release -- demo                    # обучить ~4 мин на CPU, оценить, замерить скорость
 cargo run --release --example quickstart       # то же самое из кода библиотеки
 cargo run --release --example staged           # экскурсия по API по стадиям

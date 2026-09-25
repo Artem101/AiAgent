@@ -146,7 +146,7 @@ tokens ─► TTT-Encoder ─► S_prompt ─► E_θ ─► s_0 ─► JEPA-п�
 ## Использование
 
 ```bash
-cd cog_engine
+git clone https://github.com/Artem101/AiAgent.git && cd AiAgent
 cargo run --release -- demo                         # обучить (~4 мин), оценить, замерить
 cargo run --release -- train --task sort --steps 1500 --out model.safetensors
 cargo run --release -- infer --ckpt model.safetensors --prompt "3 1 4 1 5 9 2 6" [--planner mppi+gd] [--solver heun --ode-steps 16]
@@ -185,7 +185,7 @@ let gen = engine.generate_into(&[3, 1, 4, 1, 5, 9, 2, 6], /*seed*/ 0, &mut out)?
 ## Структура
 
 ```
-cog_engine/
+AiAgent/                         # корень репозитория = крейт cog_engine
 ├── Cargo.toml
 ├── src/
 │   ├── lib.rs, main.rs          # библиотека и CLI (demo/train/infer/bench/serve)
