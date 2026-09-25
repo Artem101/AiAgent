@@ -484,6 +484,11 @@ impl CognitiveEngine {
             ActionDecoder::ProbeStart => self.decode_probe(0, out)?,
             ActionDecoder::ProbeVote => self.decode_vote(out)?,
             ActionDecoder::ProbeConsensus => self.decode_consensus(out)?,
+            ActionDecoder::ProbeFirst => {
+                self.decode_consensus(out)?;
+                let l = self.cfg.answer_len();
+                out.copy_from_slice(&self.proposals[..l]); // the proposal of s_0
+            }
         }
         let t3 = Instant::now();
         Ok(Generation {

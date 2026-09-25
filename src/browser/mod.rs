@@ -95,10 +95,10 @@ pub fn engine_config(preset: &str) -> Result<EngineConfig> {
     cfg.planner.tree_beam = TREE_BEAM;
     cfg.planner.tree_branch = TREE_BRANCH;
     cfg.planner.kind = PlannerKind::MppiThenGradient;
-    // Actions are read from the thoughts: the whole action proposed by the thought that all
-    // thoughts of the plan and the surviving hypotheses agree on most (see `EnginePolicy`,
-    // which falls back to the best well-formed proposal).
-    cfg.decoder = ActionDecoder::ProbeConsensus;
+    // Actions are read from the thoughts: the first thought decides, and the rest of the plan and
+    // the surviving tree hypotheses, ranked by how much all thoughts agree on them, are the
+    // alternatives `EnginePolicy` acts on when that action is malformed or had no effect.
+    cfg.decoder = ActionDecoder::ProbeFirst;
     Ok(cfg)
 }
 

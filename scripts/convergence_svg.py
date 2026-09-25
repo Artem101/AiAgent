@@ -19,7 +19,7 @@ PANELS = {
     "agent3": ("Агент: успешные эпизоды, все шесть семейств (200 задач, симулятор), %", None),
     "steps3": ("Агент: точные действия на отдельных состояниях (500 состояний), %", None),
     "calc3": ("Арифметика: верный ответ через калькулятор (эпизоды семейства calc), %", None),
-    "text3": ("Продолжение текста: верный следующий токен (500 отложенных предложений), %", None),
+    "text3": ("Продолжение текста: верный следующий токен (500 отложенных предложений), %", 15),
 }
 # Fixed slot order (blue, orange, aqua, yellow). Each entity keeps its color on every panel;
 # a panel shows at most three series (the validated all-pairs cap) and orange never meets

@@ -155,6 +155,10 @@ pub enum ActionDecoder {
     /// over all thoughts wins. Unlike the per-position vote it never splices the verb of one
     /// thought with the text of another.
     ProbeConsensus,
+    /// The first thought `s_0` decides; the other thoughts and the tree hypotheses are ranked
+    /// as in [`ActionDecoder::ProbeConsensus`] and serve as alternatives when a caller rejects
+    /// the first choice (see `CognitiveEngine::ranked_proposals`).
+    ProbeFirst,
 }
 
 impl ActionDecoder {
@@ -165,7 +169,10 @@ impl ActionDecoder {
             "probe-start" => Ok(Self::ProbeStart),
             "probe-vote" => Ok(Self::ProbeVote),
             "probe-consensus" => Ok(Self::ProbeConsensus),
-            other => bail!("unknown decoder '{other}' (flow | probe | probe-start | probe-vote | probe-consensus)"),
+            "probe-first" => Ok(Self::ProbeFirst),
+            other => {
+                bail!("unknown decoder '{other}' (flow | probe | probe-start | probe-vote | probe-consensus | probe-first)")
+            }
         }
     }
 }

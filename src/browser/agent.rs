@@ -103,7 +103,8 @@ impl Policy for EnginePolicy {
         // that had no effect here, act on the best proposal that is well-formed and new
         // (hypotheses that decode into nonsense or into a dead end are pruned).
         let usable = |t: &[u32]| Action::decode(t, text::ru()).filter(|a| !self.no_effect.contains(a));
-        if self.engine.decoder() == ActionDecoder::ProbeConsensus && usable(&out).is_none() {
+        let ranked = matches!(self.engine.decoder(), ActionDecoder::ProbeConsensus | ActionDecoder::ProbeFirst);
+        if ranked && usable(&out).is_none() {
             if let Some((_, p)) = self.engine.ranked_proposals().into_iter().find(|(_, p)| usable(p).is_some()) {
                 out = p;
             }

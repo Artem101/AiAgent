@@ -68,10 +68,10 @@ step  1500 | loss 0.2369 | cfm 0.0418 ce 0.0148 head 0.0105 | inv 0.0170 var 0.0
 отдельного RNG-потока и печатает:
 
 ```
-step  1500 | eval n=128 | oracle plan: tok 97.9% seq 84.4%
-           engine π+MPPI    tok  96.8% seq  80.5% | energy 0.0120 (warm start 0.0232) |   8948 µs/query
-             π only         tok  95.2% seq  71.9% | energy 0.0232 (warm start 0.0232) |   4394 µs/query
-             MPPI (zero init) tok  83.8% seq  37.5% | energy 0.0128 (warm start 0.0366) |   8611 µs/query
+step  1500 | eval n=128 | oracle plan: tok 98.3% seq 87.5%
+           engine π+MPPI    tok  97.7% seq  85.9% | energy 0.0126 (warm start 0.0260) |   6379 µs/query
+             π only         tok  97.4% seq  84.4% | energy 0.0260 (warm start 0.0260) |   3738 µs/query
+             MPPI (zero init) tok  96.1% seq  76.6% | energy 0.0137 (warm start 0.0522) |   6549 µs/query
 ```
 
 | Строка | Что измеряет |
@@ -135,7 +135,7 @@ gated pools, пробу мыслей с копированием, горизон
 
 ## Советы по гиперпараметрам
 
-* **Больше шагов почти всегда лучше**: к 1500 шагам `tiny` ещё не сошёлся (oracle 84% по
+* **Больше шагов почти всегда лучше**: к 1500 шагам `tiny` ещё не сошёлся (oracle 87.5% по
   последовательностям). Для 2000–3000 шагов увеличьте `steps`, остальное менять не нужно.
 * **`plan_noise`** (0.05) делает декодер устойчивее к неточным планам. При большом разрыве
   oracle ↔ engine попробуйте 0.1.

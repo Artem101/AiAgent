@@ -141,7 +141,7 @@ printf '3 1 4 1 5 9 2 6\n' | nc 127.0.0.1 7878
 | `--tree <B>` | ширина луча латентного дерева гипотез; `0` — без дерева |
 | `--iters <n>` | итераций MPPI; `0` — план из дерева или роллаута политики |
 | `--solver`, `--ode-steps` | решатель ODE декодера |
-| `--decoder flow\|probe\|probe-start\|probe-vote\|probe-consensus` | декодер действия (см. `decoder` в [configuration.md](configuration.md)); у агента по умолчанию `probe-consensus` |
+| `--decoder flow\|probe\|probe-start\|probe-vote\|probe-consensus\|probe-first` | декодер действия (см. `decoder` в [configuration.md](configuration.md)); у агента по умолчанию `probe-first` |
 
 ### `tokenizer`
 
