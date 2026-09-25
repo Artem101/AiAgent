@@ -22,7 +22,8 @@ Workspace'ы по модулям:
 
 | Workspace | Где | Содержимое |
 |---|---|---|
-| `TttWorkspace` | `ttt/mod.rs` | `x, x̃, k, v, q, z, Σz`, вход readout, скрытый слой, `W_fast`, `S_prompt` |
+| `TttWorkspace` | `ttt/mod.rs` | `x, x̃, k, v, q, z, Σz`, вход readout, скрытый слой, `W_fast`, `S_prompt`; с копированием — ключи и токены промпта (`max_prompt_len × copy_dim`) |
+| `CopyScratch` | `copy.rs` | запрос и два распределения указателя (`max_prompt_len`) для смеси словаря с копированием |
 | `MppiWorkspace` | `jepa/planner.rs` | действия и состояния всех `M` роллаутов, стоимости, веса, номинал, лучший сэмпл, буферы политики, план |
 | внутренний workspace `PackedVectorField` | `flow/vector_field.rs` | `h, a, q, k, v`, выход внимания, MLP, K/V плана на каждый слой, скоры |
 | `SamplerBuffers` | `flow/ode_solver.rs` | `X`, промежуточная точка, две скорости |

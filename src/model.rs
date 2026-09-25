@@ -5,12 +5,15 @@
 //! ```text
 //!   L = L_CFM + λ_ce CE(head(x̂_1), y) + λ_head CE(head(X_1 + 0.1ε), y)
 //!       + λ_inv Inv + λ_var Var + λ_cov Cov + λ_goal ‖G(s_0) − s̄_H‖² + λ_π ‖π(ŝ_t, ĝ) − a_t‖²
-//!       [+ λ_probe CE(probe(s_0), y)]
+//!       [+ λ_probe mean_{h ∈ S} −log P(y | Θ_probe ŝ_h)]
 //! ```
 //!
 //! where `x̂_1 = X_t + (1 − t) v_θ` is the one-step estimate of the clean sample and the
-//! decoder is conditioned on the teacher-forced latent plan `[s_0, ŝ_1, …, ŝ_H]`. The answer
-//! probe is optional (`JepaConfig::probe_weight > 0`).
+//! decoder is conditioned on the teacher-forced latent plan `[s_0, ŝ_1, …, ŝ_H]`. The thought
+//! probe is optional (`JepaConfig::probe_weight > 0`); `S` holds `s_0`, `s_H` and random
+//! intermediate thoughts (all of them by default, see `TrainConfig::probe_states`); `P` is the softmax of the shared head,
+//! or its mixture with pointers into the prompt when the copy mechanism is on
+//! (`JepaConfig::copy_dim > 0`, see [`crate::copy`]).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -56,7 +59,7 @@ pub struct LossReport {
     pub cov: f32,
     pub goal: f32,
     pub policy: f32,
-    /// Answer-probe cross-entropy (0 when the probe is disabled).
+    /// Thought-probe cross-entropy (0 when the probe is disabled).
     pub probe: f32,
 }
 
@@ -140,8 +143,9 @@ impl CogModel {
         self.online.num_params()
     }
 
-    /// TTT readouts after the prompt and after each answer chunk (`H + 1` tensors `[B, d_ctx]`).
-    fn readouts(&self, batch: &Batch, dtype: DType) -> Result<Vec<Tensor>> {
+    /// TTT readouts after the prompt and after each answer chunk (`H + 1` tensors `[B, d_ctx]`),
+    /// and the copy keys of the prompt tokens (`[B, N, d_key]`, with a copy mechanism).
+    fn readouts(&self, batch: &Batch, dtype: DType) -> Result<(Vec<Tensor>, Option<Tensor>)> {
         let n = batch.prompt.dims2()?.1;
         let (l, h) = (self.cfg.answer_len(), self.cfg.jepa.horizon);
         let chunk = l / h;
@@ -151,12 +155,12 @@ impl CogModel {
         )?
         .to_dtype(dtype)?;
         let snaps: Vec<usize> = (0..=h).map(|i| n + i * chunk).collect();
-        self.ttt.encode_snapshots(&x, &snaps)
+        self.ttt.encode_with_keys(&x, &snaps, n)
     }
 
     /// Teacher-forced latent plan `[B, H + 1, d_s]` (uses the answer — evaluation oracle).
     pub fn teacher_plan(&self, batch: &Batch, dtype: DType) -> Result<Tensor> {
-        let readouts = self.readouts(batch, dtype)?;
+        let (readouts, _) = self.readouts(batch, dtype)?;
         Ok(self.jepa.forward_train(&readouts, &self.cfg.jepa)?.0)
     }
 
@@ -167,14 +171,53 @@ impl CogModel {
         let (dt, vocab) = (self.cfg.flow.d_token, self.cfg.vocab_size);
 
         // TTT → JEPA
-        let readouts = self.readouts(batch, cd)?;
+        let (readouts, keys) = self.readouts(batch, cd)?;
         let (mut plan, terms) = self.jepa.forward_train(&readouts, &self.cfg.jepa)?;
         let targets = batch.answer.flatten_all()?;
         let mut probe_ce = None;
         if let Some(probe) = &self.jepa.probe {
-            let s0 = plan.narrow(1, 0, 1)?.squeeze(1)?;
-            let logits = probe.forward(&s0)?.to_dtype(DType::F32)?.reshape((b * l, vocab))?;
-            probe_ce = Some(candle_nn::loss::cross_entropy(&logits, &targets)?);
+            // every thought s_0 … s_H must decode into the answer through the shared head —
+            // and so must the goal ĝ the latent search steers towards (`probe_goal`)
+            let h = self.cfg.jepa.horizon;
+            let mut states = if tc.probe_states >= 2 && tc.probe_states < h + 1 {
+                // s_0, s_H and a random subset of the intermediate thoughts (a new one each step)
+                let mut idx = vec![0u32, h as u32];
+                while idx.len() < tc.probe_states {
+                    let i = 1 + rng.below(h - 1) as u32;
+                    if !idx.contains(&i) {
+                        idx.push(i);
+                    }
+                }
+                let idx = Tensor::from_vec(idx, tc.probe_states, &self.device)?;
+                plan.index_select(&idx, 1)?
+            } else {
+                plan.clone()
+            };
+            if tc.probe_goal {
+                let s0 = plan.narrow(1, 0, 1)?.squeeze(1)?;
+                states = Tensor::cat(&[states, self.jepa.goal_of(&s0)?.unsqueeze(1)?], 1)?;
+            }
+            let n = states.dims()[1];
+            let states = states.reshape((b * n, self.cfg.jepa.d_state))?;
+            let emb = probe.forward(&states)?.reshape((b * n, l, dt))?;
+            let logits = self.head.forward(&emb)?.to_dtype(DType::F32)?;
+            let per_state = |t: &Tensor| -> Result<Tensor> {
+                // [B, …] → [B·n, …], row b·n + j for thought j of example b
+                let mut dims = t.dims().to_vec();
+                let mut rep = vec![1; dims.len() + 1];
+                rep[1] = n;
+                let r = t.unsqueeze(1)?.repeat(rep)?;
+                dims[0] *= n;
+                r.reshape(dims)
+            };
+            let tgt = per_state(&batch.answer)?;
+            probe_ce = Some(match (&self.jepa.copy, &keys) {
+                (Some(copy), Some(keys)) => {
+                    let ll = copy.log_likelihood(&emb, &logits, &per_state(keys)?, &tgt, &per_state(&batch.prompt)?)?;
+                    ll.mean_all()?.neg()?
+                }
+                _ => candle_nn::loss::cross_entropy(&logits.reshape((b * n * l, vocab))?, &tgt.flatten_all()?)?,
+            });
         }
         if tc.plan_noise > 0.0 {
             let noise = randn(rng, plan.dims(), tc.plan_noise as f32, &self.device)?.to_dtype(cd)?;

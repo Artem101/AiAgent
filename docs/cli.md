@@ -21,7 +21,7 @@ cog_engine demo [--task sort] [--steps 1500] [флаги обучения]
 ### `train`
 
 ```bash
-cog_engine train --out model.safetensors [--task sort|reverse|copy|browser] [--steps 1500] [--preset tiny|small]
+cog_engine train --out model.safetensors [--task sort|reverse|copy|browser|text] [--steps 1500] [--preset tiny|small]
                  [--vocab 10] [--len 8] [--batch 64] [--lr 2e-3] [--seed 7] [--eval-every 500]
                  [--device cpu|cuda] [--compute auto|f32|f16|bf16]
 ```
@@ -41,8 +41,20 @@ cog_engine train --out model.safetensors [--task sort|reverse|copy|browser] [--s
 | `--device` | `cpu` | `cuda` требует сборки с `--features cuda` |
 | `--compute` | `auto` | dtype прямого/обратного прохода; `auto` = f32 на CPU, bf16 на CUDA |
 | `--conv` | 1 (`browser`: 4) | `ttt.conv_width` |
-| `--readout-last` | 0 (`browser`: 3) | `ttt.readout_last` |
-| `--probe` | 0 (`browser`: 1.0) | `jepa.probe_weight` |
+| `--readout-last` | 0 (`browser`, `text`: 4) | `ttt.readout_last` |
+| `--pools` | 0 (`browser`, `text`: 4) | `ttt.readout_pools` |
+| `--probe` | 0 (`browser`, `text`: 1.0) | `jepa.probe_weight` |
+| `--horizon` | 4 (`browser`, `text`: 8) | `jepa.horizon` |
+| `--copy` | 0 (`browser`, `text`: 32) | `jepa.copy_dim`, копирование из контекста; `0` — выключить |
+| `--probe-states` | 0 (`browser`, `text`: 3) | мыслей в потере пробы за шаг (`s_0`, `s_H` и случайные промежуточные); `0` — все |
+| `--probe-goal` | 0 | `1` — обучать пробу ещё и на цели `ĝ` |
+| `--corpus` | — | текст для `--task text` или для примеси к `browser` (`scripts/fetch_ru_corpus.sh`) |
+| `--valid` | — | отложенный текст: после обучения печатается точность продолжения против униграммной и биграммной базовых линий |
+| `--text-mix` | 0.25 | доля текста в батчах `browser` |
+| `--init` | — | начать с весов чекпойнта той же архитектуры (оптимизатор — с нуля) |
+| `--start-step` | — | вместе с `--init <out>.step<N>`: продолжить прерванный прогон с шага `N` (расписание LR продолжается, поток данных пересеивается) |
+| `--save-every` | 0 | сохранять `<out>.step<N>` каждые `N` шагов (для кривых сходимости) |
+| `--log-every` | 100 | период строки лога |
 
 Флаг без значения (`--headed`) можно ставить перед другим флагом.
 
@@ -119,39 +131,80 @@ TCP-сервер на tokio с построчным протоколом.
 printf '3 1 4 1 5 9 2 6\n' | nc 127.0.0.1 7878
 ```
 
+### Флаги инференса (`infer`, `bench`, `serve`, `agent`, `agent-eval`, `complete`)
+
+Без флагов используется конфигурация чекпойнта.
+
+| Флаг | Смысл |
+|---|---|
+| `--planner mppi\|mppi+gd` | MPPI или MPPI + latent GD |
+| `--tree <B>` | ширина луча латентного дерева гипотез; `0` — без дерева |
+| `--iters <n>` | итераций MPPI; `0` — план из дерева или роллаута политики |
+| `--solver`, `--ode-steps` | решатель ODE декодера |
+| `--decoder flow\|probe\|probe-start\|probe-vote` | декодер действия (см. `decoder` в [configuration.md](configuration.md)) |
+
+### `tokenizer`
+
+```bash
+cog_engine tokenizer --corpus data/ru/train.txt [--vocab 1024] [--browser-texts 20000] [--out models/tokenizer_ru.bpe]
+```
+
+Обучает байтовый BPE на корпусе и на текстах браузерной задачи (страницы, формулировки,
+тексты действий и результаты калькулятора), каждый текст — с ведущим пробелом. Файл
+`models/tokenizer_ru.bpe` компилируется в бинарник (`text::ru()`): после переобучения токенизатора
+пересоберите проект и обучите модели заново.
+
+### `complete`
+
+```bash
+cog_engine complete --ckpt model.safetensors --text "Москва — столица"
+```
+
+Продолжение текста: следующие 16 BPE-токенов (все сразу, неавторегрессионно) для чекпойнта
+`text` или `browser` с корпусом.
+
 ### `agent`
 
 Задать вопрос агенту-браузеру (чекпойнт обучен с `--task browser`, см. [browser.md](browser.md)).
+Вопрос — свободный текст на русском: модель читает его как есть. Арифметику агент считает
+калькулятором на Python ([calculator.md](calculator.md)).
 
 ```bash
-cog_engine agent --ckpt agent.safetensors --question "Сколько стоит лампа?" [--world 42]
-                 [--browser chrome|sim] [--policy model|expert] [--max-steps 10]
+cog_engine agent --ckpt agent.safetensors --question "Сколько будет 5+5?" [--world 42]
+                 [--browser chrome|sim] [--policy model|expert] [--calc python|rust] [--max-steps 12]
                  [--headed] [--chrome /path/to/chrome] [--site-addr 127.0.0.1:0]
 ```
 
 | Флаг | По умолчанию | Смысл |
 |---|---|---|
-| `--question` | `what is the price of the lamp?` | вопрос на русском или английском: товар + атрибут (`price`, `color`, `brand`, `rating`) |
+| `--question` | `Сколько стоит лампа?` | вопрос на русском; если он совпадает с одним из шаблонов (с точностью до регистра, «ё» и знаков) или это арифметический пример, ответ проверяется |
 | `--world` | 42 | номер мира песочницы (от него зависят все факты) |
 | `--browser` | `chrome` | `chrome` — настоящий Chromium, `sim` — симулятор |
 | `--policy` | `model` | `expert` — сценарий-учитель, `--ckpt` не нужен |
-| `--max-steps` | 10 | лимит действий |
+| `--calc` | `python` | исполнитель `CALC`: изолированный `python3` или его точное зеркало на Rust |
+| `--max-steps` | 12 | лимит действий |
 | `--headed` | нет | показать окно браузера (нужен дисплей) |
+| `--allow-internet` | нет | разрешить браузеру внешние адреса (по умолчанию он видит только `localhost`/`127.0.0.1`) |
 | `--chrome` | поиск | путь к браузеру; иначе `COG_CHROME`, Playwright, `PATH` |
 
-Для каждого шага печатаются URL, что модель видит (токены наблюдения), что она делает и
-сколько думала. В конце — ответ и сверка с фактом мира.
+Для каждого шага печатаются URL, что модель видит (токены наблюдения), как она рассуждала
+(дерево гипотез по глубинам, выжившие гипотезы и цепочка мыслей, декодированные пробой), что
+она делает и сколько думала, а для `CALC` — что вернул калькулятор (`tool : python: 5+5 = 10`).
+В конце — ответ и сверка с фактом мира.
 
 ### `agent-eval`
 
 ```bash
 cog_engine agent-eval --ckpt agent.safetensors [--episodes 100] [--browser sim|chrome]
-                      [--policy model|expert] [--steps 1000] [--seed 1] [--max-steps 10]
+                      [--policy model|expert] [--calc rust|python] [--split train|heldout|both] [--steps 1000]
+                      [--seed 1] [--max-steps 12]
 ```
 
-Прогоняет случайные задачи (мир + вопрос) и печатает успешность, число неверных ответов и
-эпизодов без ответа, среднее число шагов, долю ошибочных действий и время. `--steps N` добавляет
-точность отдельных шагов по типам действий на `N` случайных состояниях.
+Прогоняет случайные задачи (мир + вопрос) и печатает успешность по семействам (поиск,
+сравнение, фильтр, арифметика, суммы цен, реплики), число неверных ответов и эпизодов без
+ответа, среднее число шагов, долю ошибочных действий и время. Калькулятор по умолчанию —
+зеркало на Rust (быстро и детерминированно; результаты те же, что у Python). `--split`
+выбирает обучающие или отложенные формулировки. `--steps N` добавляет точность отдельных шагов по типам действий на `N` случайных состояниях.
 
 ### `site`
 
@@ -172,10 +225,15 @@ seed=7
 conv=1
 readout_last=0
 probe=0
+horizon=4
+pools=0
+copy=0
 ```
 
 Этих полей достаточно, чтобы воссоздать `EngineConfig` через `EngineConfig::preset`. Поля
-`conv`, `readout_last` и `probe` (`ttt.conv_width`, `ttt.readout_last`, `jepa.probe_weight`)
-необязательны: в чекпойнтах, записанных до их появления, они принимают значения 1, 0 и 0. Если
+`conv`, `readout_last`, `probe`, `horizon`, `pools` и `copy` (`ttt.conv_width`, `ttt.readout_last`,
+`jepa.probe_weight`, `jepa.horizon`, `ttt.readout_pools`, `jepa.copy_dim`) необязательны: в
+чекпойнтах, записанных до их появления, они принимают значения 1, 0, 0, 4, 0 и 0. Для задач `browser` и `text` настройки
+планировщика (дерево, latent GD) берутся из `browser::engine_config`. Если
 архитектура менялась вручную в коде, а не через пресет, CLI её не восстановит. В этом случае
 загружайте модель из кода с той же конфигурацией.

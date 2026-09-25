@@ -5,3 +5,6 @@ target/
 # trained checkpoints shipped with the repository
 !models/*.safetensors
 !models/*.cfg
+
+# downloaded corpora (scripts/fetch_ru_corpus.sh)
+data/

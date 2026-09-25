@@ -3,9 +3,14 @@
 //! `tokens → (embedding + position + segment) → TTT-Linear scan over W_fast → readout`.
 //!
 //! Readout of the final fast weights uses learned probes `P ∈ ℝ^{d_fast×r}`, the running
-//! mean of the layer outputs and, optionally, the last `m = readout_last` outputs:
-//! `S_prompt = MLP(LN([vec(W_fast^{(N)} P) ; mean_t z_t ; z_N ; … ; z_{N−m+1}]))` — O(d²)
-//! memory, independent of N.
+//! mean of the layer outputs and, optionally, the last `m = readout_last` outputs and `p =
+//! readout_pools` gated pools:
+//! `S_prompt = MLP(LN([vec(W_fast^{(N)} P) ; mean_t z_t ; z_N ; … ; z_{N−m+1} ; pool_1 ; … ; pool_p]))`,
+//! `pool_j = Σ_t g_{t,j} z_t / (Σ_t g_{t,j} + ε)` — O(d²) memory, independent of N.
+//!
+//! With the copy mechanism ([`crate::copy`], `jepa.copy_dim > 0`) the encoder also keeps a key
+//! `k_t = W_k [x̃_t ; z_t]` and the token id of every prompt position — an O(N · d_key) copy
+//! memory, bounded by `max_prompt_len`, that the decoder can point into.
 
 pub mod fast_weights;
 pub mod layer;
@@ -41,6 +46,8 @@ pub struct TttEncoder {
     pub readout: Mlp,
     /// Number of final layer outputs fed to the readout.
     pub readout_last: usize,
+    /// Keys of the copy mechanism, `[x̃_t ; z_t] → k_t` (when `jepa.copy_dim > 0`).
+    pub copy_key: Option<Lin>,
 }
 
 impl TttEncoder {
@@ -54,11 +61,16 @@ impl TttEncoder {
             probes: ps.linear("ttt.probes", t.d_fast, t.readout_probes, false)?,
             readout: ps.mlp(
                 "ttt.readout",
-                t.d_fast * t.readout_probes + t.d_fast * (1 + t.readout_last),
+                t.d_fast * t.readout_probes + t.d_fast * (1 + t.readout_last + t.readout_pools),
                 t.d_ctx,
                 t.d_ctx,
             )?,
             readout_last: t.readout_last,
+            copy_key: if cfg.jepa.copy_dim > 0 {
+                Some(ps.linear("ttt.copy_key", t.d_model * t.conv_width + t.d_fast, cfg.jepa.copy_dim, false)?)
+            } else {
+                None
+            },
         })
     }
 
@@ -83,6 +95,7 @@ impl TttEncoder {
         let probed = self.probes.forward(&snap.w)?.reshape((b, d * r))?; // vec(W P)
         let mut parts = vec![probed, snap.z_mean.clone()];
         parts.extend(snap.z_last.iter().cloned());
+        parts.extend(snap.z_pool.iter().cloned());
         let feat = Tensor::cat(&parts, 1)?;
         self.readout.forward(&nn::layer_norm(&feat)?)
     }
@@ -92,6 +105,19 @@ impl TttEncoder {
         self.layer.scan(x, snapshots, self.readout_last)?.iter().map(|s| self.readout(s)).collect()
     }
 
+    /// Readouts after each prefix length in `snapshots`, plus the copy keys `[B, n, d_key]` of
+    /// the first `n` tokens (`None` without a copy mechanism).
+    pub fn encode_with_keys(&self, x: &Tensor, snapshots: &[usize], n: usize) -> Result<(Vec<Tensor>, Option<Tensor>)> {
+        let keep = if self.copy_key.is_some() { n } else { 0 };
+        let (snaps, outputs) = self.layer.scan_with_outputs(x, snapshots, self.readout_last, keep)?;
+        let readouts = snaps.iter().map(|s| self.readout(s)).collect::<Result<Vec<_>>>()?;
+        let keys = match (&self.copy_key, outputs) {
+            (Some(k), Some((window, z))) => Some(k.forward(&Tensor::cat(&[window, z], 2)?)?),
+            _ => None,
+        };
+        Ok((readouts, keys))
+    }
+
     /// `prompt: [B, N]` → `S_prompt: [B, d_ctx]` (graph path).
     pub fn encode(&self, prompt: &Tensor, dtype: DType) -> Result<Tensor> {
         let n = prompt.dims2()?.1;
@@ -99,7 +125,8 @@ impl TttEncoder {
         Ok(self.encode_snapshots(&x, &[n])?.remove(0))
     }
 
-    pub fn pack(&self, dtype: DType) -> Result<PackedTttEncoder> {
+    /// Packs the weights; the copy memory holds the keys of the first `copy_capacity` tokens.
+    pub fn pack(&self, dtype: DType, copy_capacity: usize) -> Result<PackedTttEncoder> {
         let (vocab, d_model) = self.tok_emb.dims2()?;
         Ok(PackedTttEncoder {
             tok_emb: WeightBuf::from_tensor(&self.tok_emb, dtype)?,
@@ -112,6 +139,8 @@ impl TttEncoder {
             max_pos: self.pos_emb.dims()[0],
             d_model,
             readout_last: self.readout_last,
+            copy_key: self.copy_key.as_ref().map(|k| k.pack(dtype)).transpose()?,
+            copy_capacity,
         })
     }
 }
@@ -129,6 +158,9 @@ pub struct PackedTttEncoder {
     pub max_pos: usize,
     pub d_model: usize,
     pub readout_last: usize,
+    pub copy_key: Option<PackedLinear>,
+    /// Positions the copy memory holds.
+    pub copy_capacity: usize,
 }
 
 /// Pre-allocated buffers of [`PackedTttEncoder`] (O(d²), independent of the context length).
@@ -144,8 +176,16 @@ pub struct TttWorkspace {
     z_sum: Box<[f32]>,
     /// The last `readout_last` outputs, newest first.
     z_last: Box<[f32]>,
+    /// Gates of the current token, and running `Σ g z` / `Σ g` of the readout pools.
+    gates: Box<[f32]>,
+    pool_num: Box<[f32]>,
+    pool_den: Box<[f32]>,
     feat: Box<[f32]>,
     hidden: Box<[f32]>,
+    /// Copy memory: `[x̃_t ; z_t]` scratch, keys `[capacity, d_key]` and token ids.
+    copy_in: Box<[f32]>,
+    copy_keys: Box<[f32]>,
+    copy_tokens: Box<[u32]>,
     /// Fast weights `W_fast`.
     pub state: FastWeightsState,
     prompt: Tensor,
@@ -155,6 +195,14 @@ pub struct TttWorkspace {
 impl TttWorkspace {
     pub fn tokens_seen(&self) -> usize {
         self.n_tokens
+    }
+
+    /// Copy keys (`n × d_key`) and token ids (`n`) of the absorbed prompt (empty without a
+    /// copy mechanism).
+    pub fn copy_memory(&self) -> (&[f32], &[u32]) {
+        let n = self.n_tokens.min(self.copy_tokens.len());
+        let dk = self.copy_keys.len() / self.copy_tokens.len().max(1);
+        (&self.copy_keys[..n * dk], &self.copy_tokens[..n])
     }
 }
 
@@ -177,8 +225,14 @@ impl PackedTttEncoder {
             z: arena.host(df),
             z_sum: arena.host(df),
             z_last: arena.host(df * self.readout_last),
+            gates: arena.host(self.layer.pools()),
+            pool_num: arena.host(df * self.layer.pools()),
+            pool_den: arena.host(self.layer.pools()),
             feat: arena.host(self.readout.l1.d_in),
             hidden: arena.host(self.readout.l1.d_out),
+            copy_in: arena.host(self.copy_key.as_ref().map_or(0, |k| k.d_in)),
+            copy_keys: arena.host(self.copy_key.as_ref().map_or(0, |k| k.d_out * self.copy_capacity)),
+            copy_tokens: arena.host_u32(if self.copy_key.is_some() { self.copy_capacity } else { 0 }),
             state: FastWeightsState::in_arena(arena, df, self.layer.eta as f64)?,
             prompt: arena.tensor(self.d_ctx())?,
             n_tokens: 0,
@@ -191,6 +245,8 @@ impl PackedTttEncoder {
         ws.xn.fill(0.0);
         ws.z_sum.fill(0.0);
         ws.z_last.fill(0.0);
+        ws.pool_num.fill(0.0);
+        ws.pool_den.fill(0.0);
         ws.n_tokens = 0;
         Ok(())
     }
@@ -219,20 +275,44 @@ impl PackedTttEncoder {
             ws.z_last.copy_within(..len - df, df);
             ws.z_last[..df].copy_from_slice(&ws.z);
         }
+        if let Some(key) = &self.copy_key {
+            let t = ws.n_tokens;
+            if t < ws.copy_tokens.len() {
+                let wd = ws.xn.len();
+                ws.copy_in[..wd].copy_from_slice(&ws.xn);
+                ws.copy_in[wd..].copy_from_slice(&ws.z);
+                key.forward(&ws.copy_in, &mut ws.copy_keys[t * key.d_out..(t + 1) * key.d_out]);
+                ws.copy_tokens[t] = token;
+            }
+        }
+        if !ws.gates.is_empty() {
+            self.layer.gates(&ws.xn, &mut ws.gates);
+            for ((num, den), &g) in
+                ws.pool_num.chunks_exact_mut(ws.z.len()).zip(ws.pool_den.iter_mut()).zip(ws.gates.iter())
+            {
+                *den += g;
+                crate::kernels::axpy(num, g, &ws.z);
+            }
+        }
         ws.n_tokens += 1;
         Ok(())
     }
 
     /// Reads `S_prompt` out of the current fast weights.
     pub fn finish(&self, ws: &mut TttWorkspace) -> Result<PromptState> {
-        let TttWorkspace { feat, z_sum, z_last, hidden, state, prompt, n_tokens, .. } = ws;
+        let TttWorkspace { feat, z_sum, z_last, pool_num, pool_den, hidden, state, prompt, n_tokens, .. } = ws;
         let (rd, df) = (self.d_fast() * self.probes.d_out, self.d_fast());
         inplace::host_read(&state.weights, |w| self.probes.forward(w, &mut feat[..rd]))?;
         let inv = if *n_tokens > 0 { 1.0 / *n_tokens as f32 } else { 0.0 };
         for (f, &z) in feat[rd..rd + df].iter_mut().zip(z_sum.iter()) {
             *f = z * inv;
         }
-        feat[rd + df..].copy_from_slice(z_last);
+        let zl = rd + df + z_last.len();
+        feat[rd + df..zl].copy_from_slice(z_last);
+        for ((f, num), &den) in feat[zl..].chunks_exact_mut(df).zip(pool_num.chunks_exact(df)).zip(pool_den.iter()) {
+            let inv = 1.0 / (den + layer::POOL_EPS as f32);
+            f.iter_mut().zip(num).for_each(|(f, &n)| *f = n * inv);
+        }
         let n = feat.len();
         layer_norm_rows(feat, n);
         self.readout.l1.forward(feat, hidden);
@@ -260,6 +340,7 @@ impl PackedTttEncoder {
             + self.layer.bytes()
             + self.probes.bytes()
             + self.readout.bytes()
+            + self.copy_key.as_ref().map_or(0, |k| k.bytes())
     }
 }
 
@@ -275,6 +356,10 @@ mod tests {
         let mut cfg = EngineConfig::tiny(11, 6, 4);
         cfg.ttt.conv_width = 3;
         cfg.ttt.readout_last = 2;
+        cfg.ttt.readout_pools = 3;
+        encoder_parity(cfg.clone())?;
+        // copy memory
+        cfg.jepa.copy_dim = 5;
         encoder_parity(cfg)
     }
 
@@ -286,14 +371,25 @@ mod tests {
         let prompt = Tensor::from_slice(&tokens, (1, 6), &dev)?;
         let want = enc.encode(&prompt, DType::F32)?.squeeze(0)?.to_vec1::<f32>()?;
 
-        let packed = enc.pack(DType::F32)?;
+        let packed = enc.pack(DType::F32, 6)?;
         let mut arena = Arena::new(&dev);
         let mut ws = packed.workspace(&mut arena)?;
         let got = packed.encode(&tokens, &mut ws)?.tensor().to_vec1::<f32>()?;
         let err = want.iter().zip(&got).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
         assert!(err < 1e-4, "f32 packed vs graph: {err}");
+        if enc.copy_key.is_some() {
+            let x = enc.embed(&prompt, 0, SEGMENT_PROMPT)?;
+            let (_, keys) = enc.encode_with_keys(&x, &[6], 6)?;
+            let want = keys.unwrap().flatten_all()?.to_vec1::<f32>()?;
+            let (got, toks) = ws.copy_memory();
+            assert_eq!(toks, &tokens[..]);
+            let err = want.iter().zip(got).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            assert!(err < 1e-4, "copy keys packed vs graph: {err}");
+        } else {
+            assert!(ws.copy_memory().1.is_empty());
+        }
 
-        let packed16 = enc.pack(DType::BF16)?;
+        let packed16 = enc.pack(DType::BF16, 6)?;
         let mut ws16 = packed16.workspace(&mut Arena::new(&dev))?;
         let got16 = packed16.encode(&tokens, &mut ws16)?.tensor().to_vec1::<f32>()?;
         let scale = want.iter().map(|v| v.abs()).fold(0f32, f32::max);
@@ -307,6 +403,7 @@ mod tests {
         }
         assert_eq!(ws.state.weights.elem_count(), before);
         assert_eq!(ws.tokens_seen(), 1006);
+        assert!(ws.copy_memory().1.len() <= 6, "the copy memory is bounded");
         assert!(packed.absorb(99, SEGMENT_PROMPT, &mut ws).is_err());
         Ok(())
     }

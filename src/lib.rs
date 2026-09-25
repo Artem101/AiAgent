@@ -38,6 +38,7 @@
 pub mod arena;
 pub mod browser;
 pub mod config;
+pub mod copy;
 pub mod data;
 pub mod flow;
 pub mod jepa;
@@ -45,6 +46,8 @@ pub mod kernels;
 pub mod model;
 pub mod nn;
 pub mod pipeline;
+pub mod text;
+pub mod tools;
 pub mod train;
 pub mod ttt;
 pub mod types;

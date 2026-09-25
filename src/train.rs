@@ -89,7 +89,10 @@ impl Trainer {
     /// Creates the optimiser over the model's trainable parameters.
     pub fn new(model: CogModel, tc: TrainConfig) -> Result<Self> {
         let cfg = &model.cfg;
-        let sampler = TaskSampler::new(tc.task, cfg.vocab_size, cfg.max_prompt_len, cfg.answer_len())?;
+        let mut sampler = TaskSampler::new(tc.task, cfg.vocab_size, cfg.max_prompt_len, cfg.answer_len())?;
+        if let Some(path) = &tc.corpus {
+            sampler = sampler.with_corpus_file(path, tc.text_mix)?;
+        }
         let vars = model.trainable_vars();
         let opt =
             AdamW::new(vars.clone(), ParamsAdamW { lr: tc.lr, weight_decay: tc.weight_decay, ..Default::default() })?;
@@ -100,6 +103,13 @@ impl Trainer {
     /// Number of optimisation steps taken so far.
     pub fn step(&self) -> usize {
         self.step
+    }
+
+    /// Continues an interrupted run (weights loaded from its checkpoint) at `step`: the LR
+    /// schedule resumes there and the data stream is re-seeded (AdamW moments restart).
+    pub fn resume_at(&mut self, step: usize) {
+        self.step = step;
+        self.rng = Rng::stream(self.model.cfg.seed, 0x7EA1, step as u64);
     }
 
     /// Linear warmup, then cosine decay to `min_lr`.
@@ -188,12 +198,20 @@ impl Trainer {
     }
 
     /// Runs the configured number of steps, logging through `log`.
-    pub fn run(&mut self, mut log: impl FnMut(&str)) -> Result<Option<EvalReport>> {
+    pub fn run(&mut self, log: impl FnMut(&str)) -> Result<Option<EvalReport>> {
+        self.run_until(self.tc.steps, log)
+    }
+
+    /// Trains up to step `until` (at most the configured number of steps); the learning-rate
+    /// schedule always follows the full run, so a run split into segments is identical to one
+    /// in a single call.
+    pub fn run_until(&mut self, until: usize, mut log: impl FnMut(&str)) -> Result<Option<EvalReport>> {
+        let until = until.min(self.tc.steps);
         let mut acc = LossReport::default();
         let mut acc_n = 0usize;
         let mut last_eval = None;
-        let t0 = Instant::now();
-        while self.step < self.tc.steps {
+        let (t0, start) = (Instant::now(), self.step);
+        while self.step < until {
             let (r, gnorm) = self.train_step()?;
             acc.accumulate(&r);
             acc_n += 1;
@@ -203,7 +221,7 @@ impl Trainer {
                 log(&format!(
                     "step {s:>5} | {mean} | |g| {gnorm:.3} | lr {:.2e} | {:.1} step/s",
                     self.lr_at(s - 1),
-                    s as f64 / t0.elapsed().as_secs_f64()
+                    (s - start) as f64 / t0.elapsed().as_secs_f64()
                 ));
                 acc = LossReport::default();
                 acc_n = 0;

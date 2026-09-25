@@ -27,6 +27,7 @@ const SNAPSHOT_JS: &str = r#"(() => {
     const r = el.getBoundingClientRect();
     if (r.width === 0 && r.height === 0) continue;
     const tag = el.tagName.toLowerCase();
+    if (tag === 'td' && el.querySelector('a')) continue; // the link represents its cell
     el.setAttribute('data-aid', String(out.length));
     out.push({ tag, text: tag === 'input' ? '' : el.innerText.trim(), value: tag === 'input' ? el.value : '' });
   }
@@ -47,11 +48,20 @@ pub struct ChromeOptions {
     pub no_sandbox: bool,
     /// Time to wait for a page load.
     pub load_timeout: Duration,
+    /// Resolve nothing but the loopback (`localhost`, `127.0.0.1`, `[::1]`): the browser can
+    /// reach the local sandbox and nothing else, not even its own background services.
+    pub local_only: bool,
 }
 
 impl Default for ChromeOptions {
     fn default() -> Self {
-        Self { executable: None, headless: true, no_sandbox: true, load_timeout: Duration::from_secs(15) }
+        Self {
+            executable: None,
+            headless: true,
+            no_sandbox: true,
+            load_timeout: Duration::from_secs(15),
+            local_only: true,
+        }
     }
 }
 
@@ -107,6 +117,12 @@ impl Chrome {
         if opts.no_sandbox {
             cmd.arg("--no-sandbox");
         }
+        if opts.local_only {
+            // Direct connections only (a proxy would resolve names itself), and no names but
+            // the loopback resolve.
+            cmd.arg("--no-proxy-server");
+            cmd.arg("--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE localhost, EXCLUDE 127.0.0.1, EXCLUDE [::1]");
+        }
         cmd.args([
             "--remote-debugging-port=0",
             "--no-first-run",
@@ -114,11 +130,18 @@ impl Chrome {
             "--disable-gpu",
             "--disable-dev-shm-usage",
             "--disable-extensions",
+            // The agent only browses the local sandbox: no background traffic to the internet.
             "--disable-background-networking",
+            "--disable-component-update",
+            "--disable-domain-reliability",
+            "--disable-client-side-phishing-detection",
+            "--disable-default-apps",
+            "--no-pings",
             "--disable-sync",
             "--mute-audio",
             // Back/forward cache would restore pages without a load event.
-            "--disable-features=BackForwardCache,Translate,MediaRouter",
+            "--disable-features=BackForwardCache,Translate,MediaRouter,OptimizationHints,\
+             CertificateTransparencyComponentUpdater,NetworkTimeServiceQuerying,HttpsUpgrades",
             "--window-size=1024,768",
         ])
         .arg(format!("--user-data-dir={}", profile.display()))

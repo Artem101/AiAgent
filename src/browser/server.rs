@@ -114,8 +114,9 @@ mod tests {
         let home = get(&server, "/w/3/");
         assert!(home.starts_with("HTTP/1.1 200 OK"));
         assert!(home.contains("<input name=\"q\""));
-        let item = get(&server, "/w/3/item/lamp");
-        assert!(item.contains("<h1>lamp</h1>") && item.contains("<th>price</th>"));
+        let item = get(&server, &format!("/w/3/item/{}", crate::browser::world::url_encode("лампа")));
+        assert!(item.contains("<h1>лампа</h1>") && item.contains("<th>цена</th>"), "{item}");
+        assert!(get(&server, "/w/3/catalog?page=2").contains("Далее"));
         assert!(get(&server, "/nope").starts_with("HTTP/1.1 404"));
     }
 }

@@ -3,17 +3,23 @@
 //! ```text
 //! cog_engine demo  [--task sort] [--steps 1500]            train briefly, evaluate, benchmark
 //! cog_engine train --out model.safetensors [--task sort|reverse|copy] [--steps N] [--preset tiny|small]
-//!                  [--vocab 10] [--len 8] [--batch 64] [--lr 2e-3] [--seed 7]
+//!                  [--vocab 10] [--len 8] [--batch 64] [--lr 2e-3] [--seed 7] [--save-every N]
+//!                  [--init ckpt [--start-step N]]
 //!                  [--device cpu|cuda] [--compute auto|f32|f16|bf16] [--eval-every 500]
 //! cog_engine infer --ckpt model.safetensors --prompt "3 1 4 1 5 9 2 6" [--planner mppi|mppi+gd]
 //!                  [--solver heun|midpoint|euler] [--ode-steps 16] [--seed 0]
 //! cog_engine bench [--ckpt model.safetensors] [--iters 200]
 //! cog_engine serve --ckpt model.safetensors [--addr 127.0.0.1:7878]   (tokio, one prompt per line)
 //!
-//! browsing agent (train with `--task browser`):
-//! cog_engine agent --ckpt agent.safetensors --question "сколько стоит лампа" [--world 42]
-//!                  [--browser chrome|sim] [--policy model|expert] [--max-steps 10] [--headed]
+//! Russian text and the browsing agent (BPE tokenizer `models/tokenizer_ru.bpe`):
+//! cog_engine tokenizer --corpus data/ru/train.txt [--vocab 1024] [--out models/tokenizer_ru.bpe]
+//! cog_engine train --task text|browser --corpus data/ru/train.txt [--valid data/ru/valid.txt] [--text-mix 0.25] …
+//! cog_engine complete --ckpt model.safetensors --text "Москва — столица"   (next 8 tokens)
+//! cog_engine text-eval --ckpt model.safetensors [--corpus data/ru/train.txt] [--valid data/ru/valid.txt] [--n 1000]
+//! cog_engine agent --ckpt agent.safetensors --question "Сколько будет 5+5?" [--world 42]
+//!                  [--browser chrome|sim] [--policy model|expert] [--calc python|rust] [--max-steps 12] [--headed]
 //! cog_engine agent-eval --ckpt agent.safetensors [--episodes 100] [--browser sim|chrome] [--policy model|expert]
+//!                  [--calc rust|python] [--split train|heldout] [--steps 1000]
 //! cog_engine site  [--addr 127.0.0.1:8080]                  serve the sandbox web for a human browser
 //! ```
 
@@ -25,13 +31,15 @@ use candle_core::{bail, DType, Device, Result};
 
 use cog_engine::browser::agent::{self as browsing, EnginePolicy, ExpertPolicy, Policy};
 use cog_engine::browser::chrome::{Chrome, ChromeOptions};
+use cog_engine::browser::goal::{self, Goal, Split};
 use cog_engine::browser::sim::SIM_ORIGIN;
-use cog_engine::browser::vocab::{self, token_str};
-use cog_engine::browser::{Browser, Goal, SimBrowser, SiteServer};
+use cog_engine::browser::{obs, Browser, SimBrowser, SiteServer};
 use cog_engine::config::PlannerKind;
 use cog_engine::data::Task;
 use cog_engine::flow::SolverKind;
 use cog_engine::kernels::simd::simd_level;
+use cog_engine::text::{self, Bpe, Corpus};
+use cog_engine::tools::{Calculator, PythonCalc, RustCalc};
 use cog_engine::train::Trainer;
 use cog_engine::{CogModel, CognitiveEngine, EngineConfig, TrainConfig};
 
@@ -86,18 +94,29 @@ struct Meta {
     readout_last: usize,
     /// Answer-probe loss weight (`jepa.probe_weight`; > 0 adds the probe head).
     probe: f64,
+    /// Planning horizon (`jepa.horizon`).
+    horizon: usize,
+    /// Gated readout pools (`ttt.readout_pools`).
+    pools: usize,
+    /// Copy-mechanism key width (`jepa.copy_dim`).
+    copy: usize,
 }
 
 impl Meta {
     fn from_args(a: &Args) -> Result<Self> {
         let task = Task::parse(&a.get("task", "sort"))?;
-        // The browsing task needs the causal window and the query readout (see docs/browser.md).
-        let (conv, last, probe) = match task {
-            Task::Browser => {
-                (cog_engine::browser::CONV_WIDTH, cog_engine::browser::READOUT_LAST, cog_engine::browser::PROBE_WEIGHT)
-            }
-            _ => (1, 0, 0.0),
-        };
+        // Text tasks use the browser architecture: causal window, query readout, answer probe,
+        // horizon 8 (see docs/browser.md and docs/reasoning.md).
+        let defaults = EngineConfig::tiny(2, 1, 4);
+        let c = if task.uses_text() { cog_engine::browser::engine_config("tiny")? } else { defaults };
+        let (conv, last, probe, horizon, pools, copy) = (
+            c.ttt.conv_width,
+            c.ttt.readout_last,
+            c.jepa.probe_weight,
+            c.jepa.horizon,
+            c.ttt.readout_pools,
+            c.jepa.copy_dim,
+        );
         // Fixed-size tasks record their real dimensions (`Task::dims` ignores the flags).
         let (vocab, len, _) = task.dims(a.num("vocab", 10)?, a.num("len", 8)?);
         Ok(Self {
@@ -109,22 +128,32 @@ impl Meta {
             conv: a.num("conv", conv)?,
             readout_last: a.num("readout-last", last)?,
             probe: a.num("probe", probe)?,
+            horizon: a.num("horizon", horizon)?,
+            pools: a.num("pools", pools)?,
+            copy: a.num("copy", copy)?,
         })
     }
 
     fn config(&self) -> Result<EngineConfig> {
         let (vocab, n, l) = self.task.dims(self.vocab, self.len);
-        let mut cfg = EngineConfig::preset(&self.preset, vocab, n, l)?;
+        let mut cfg = if self.task.uses_text() {
+            cog_engine::browser::engine_config(&self.preset)? // incl. the latent reasoning settings
+        } else {
+            EngineConfig::preset(&self.preset, vocab, n, l)?
+        };
         cfg.seed = self.seed;
         cfg.ttt.conv_width = self.conv;
         cfg.ttt.readout_last = self.readout_last;
         cfg.jepa.probe_weight = self.probe;
+        cfg.jepa.horizon = self.horizon;
+        cfg.ttt.readout_pools = self.pools;
+        cfg.jepa.copy_dim = self.copy;
         Ok(cfg)
     }
 
     fn save(&self, ckpt: &str) -> Result<()> {
         let s = format!(
-            "preset={}\nvocab={}\nlen={}\ntask={}\nseed={}\nconv={}\nreadout_last={}\nprobe={}\n",
+            "preset={}\nvocab={}\nlen={}\ntask={}\nseed={}\nconv={}\nreadout_last={}\nprobe={}\nhorizon={}\npools={}\ncopy={}\n",
             self.preset,
             self.vocab,
             self.len,
@@ -132,7 +161,10 @@ impl Meta {
             self.seed,
             self.conv,
             self.readout_last,
-            self.probe
+            self.probe,
+            self.horizon,
+            self.pools,
+            self.copy
         );
         std::fs::write(format!("{ckpt}.cfg"), s).map_err(candle_core::Error::wrap)
     }
@@ -156,6 +188,9 @@ impl Meta {
                 Some(v) => v.parse().map_err(candle_core::Error::wrap)?,
                 None => 0.0,
             },
+            horizon: if kv.contains_key("horizon") { num("horizon")? as usize } else { 4 },
+            pools: if kv.contains_key("pools") { num("pools")? as usize } else { 0 },
+            copy: if kv.contains_key("copy") { num("copy")? as usize } else { 0 },
         })
     }
 }
@@ -171,19 +206,34 @@ fn fmt_tokens(t: &[u32]) -> String {
     t.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(" ")
 }
 
-/// Token ids, followed by their words for the browsing task.
+/// Token ids, followed by their text for the text tasks.
 fn fmt_task_tokens(task: Task, t: &[u32]) -> String {
-    match task {
-        Task::Browser => format!("{}  ⟨{}⟩", fmt_tokens(t), vocab::describe(t)),
-        _ => fmt_tokens(t),
+    if task.uses_text() {
+        format!("{}  ⟨{}⟩", fmt_tokens(t), obs::describe(t))
+    } else {
+        fmt_tokens(t)
     }
 }
 
+/// Inference overrides: `--planner mppi|mppi+gd`, `--tree <beam>` (0 = no tree search),
+/// `--iters <MPPI iterations>`, `--solver`, `--ode-steps`. Without flags the checkpoint's
+/// configuration is kept.
 fn configure_engine(engine: &mut CognitiveEngine, a: &Args) -> Result<()> {
-    match a.get("planner", "mppi").as_str() {
-        "mppi" => engine.set_planner(PlannerKind::Mppi),
-        "mppi+gd" | "gd" => engine.set_planner(PlannerKind::MppiThenGradient),
-        other => bail!("unknown planner '{other}' (mppi | mppi+gd)"),
+    if let Some(p) = a.opts.get("planner") {
+        match p.as_str() {
+            "mppi" => engine.set_planner(PlannerKind::Mppi),
+            "mppi+gd" | "gd" => engine.set_planner(PlannerKind::MppiThenGradient),
+            other => bail!("unknown planner '{other}' (mppi | mppi+gd)"),
+        }
+    }
+    if a.opts.contains_key("tree") {
+        engine.set_tree(a.num("tree", 0)?)?;
+    }
+    if a.opts.contains_key("iters") {
+        engine.set_mppi_iterations(a.num("iters", 8)?);
+    }
+    if let Some(d) = a.opts.get("decoder") {
+        engine.set_decoder(cog_engine::pipeline::ActionDecoder::parse(d)?)?;
     }
     let steps = a.num("ode-steps", engine.config().flow.solver.steps)?;
     engine.set_solver(SolverKind::parse(&a.get("solver", "heun"))?, steps);
@@ -206,6 +256,14 @@ fn train_config(a: &Args, task: Task) -> Result<TrainConfig> {
     tc.batch_size = a.num("batch", tc.batch_size)?;
     tc.lr = a.num("lr", tc.lr)?;
     tc.eval_every = a.num("eval-every", tc.eval_every)?;
+    tc.log_every = a.num("log-every", tc.log_every)?;
+    tc.corpus = a.opts.get("corpus").map(Into::into);
+    tc.text_mix = a.num("text-mix", tc.text_mix)?;
+    tc.probe_goal = a.num::<u8>("probe-goal", tc.probe_goal as u8)? != 0;
+    if task.uses_text() {
+        tc.probe_states = cog_engine::browser::PROBE_STATES;
+    }
+    tc.probe_states = a.num("probe-states", tc.probe_states)?;
     tc.compute_dtype = match a.get("compute", "auto").as_str() {
         "auto" => None,
         "f32" => Some(DType::F32),
@@ -231,6 +289,10 @@ fn cmd_train(a: &Args, demo: bool) -> Result<()> {
     let tc = train_config(a, meta.task)?;
     let device = train_device(a)?;
     let model = CogModel::new(cfg.clone(), &device)?;
+    if let Some(init) = a.opts.get("init") {
+        model.load(init)?; // continue from a checkpoint of the same architecture
+        println!("initialised from {init}");
+    }
     println!(
         "cog_engine | task={} vocab={} N={} L={} | preset={} | {} params | train {:?}/{:?} | simd={} | rayon threads={}",
         meta.task.name(),
@@ -245,16 +307,34 @@ fn cmd_train(a: &Args, demo: bool) -> Result<()> {
         rayon::current_num_threads()
     );
     let mut trainer = Trainer::new(model, tc)?;
-    let report = trainer.run(|line| println!("{line}"))?;
+    if a.opts.contains_key("start-step") {
+        // `--init <out>.step<N> --start-step N`: continue an interrupted run
+        trainer.resume_at(a.num("start-step", 0)?);
+        println!("resuming at step {}", trainer.step());
+    }
+    let out = a.get("out", if demo { "" } else { "model.safetensors" });
+    // `--save-every N`: intermediate checkpoints `<out>.step<N>` for convergence studies.
+    let every: usize = a.num("save-every", 0)?;
+    let mut report = None;
+    while trainer.step() < trainer.tc.steps {
+        let until = if every > 0 { trainer.step() + every } else { trainer.tc.steps };
+        report = trainer.run_until(until, |line| println!("{line}"))?.or(report);
+        if every > 0 && !out.is_empty() && trainer.step() < trainer.tc.steps {
+            let path = format!("{}.step{}", out.trim_end_matches(".safetensors"), trainer.step());
+            trainer.model.save(&path)?;
+            meta.save(&path)?;
+            println!("saved {path}");
+        }
+    }
     if let Some(r) = &report {
         for (p, t, y) in &r.examples {
             let mark = if t == y { "✓" } else { "✗" };
             match meta.task {
-                Task::Browser => println!(
-                    "  {mark} page ⟨{}⟩\n      → expert ⟨{}⟩ | engine ⟨{}⟩",
-                    vocab::describe(p),
-                    vocab::describe(t),
-                    vocab::describe(y)
+                Task::Browser | Task::Text => println!(
+                    "  {mark} ⟨{}⟩\n      → target ⟨{}⟩ | engine ⟨{}⟩",
+                    obs::describe(p),
+                    obs::describe(t),
+                    obs::describe(y)
                 ),
                 _ => println!(
                     "  {mark} prompt [{}] → target [{}] | engine [{}]",
@@ -265,18 +345,26 @@ fn cmd_train(a: &Args, demo: bool) -> Result<()> {
             }
         }
     }
-    let out = a.get("out", if demo { "" } else { "model.safetensors" });
     if !out.is_empty() {
         trainer.model.save(&out)?;
         meta.save(&out)?;
         println!("saved {out} (+ {out}.cfg)");
     }
+    if let (Some(train), Some(valid)) = (&trainer.sampler.corpus, a.opts.get("valid")) {
+        let valid = Corpus::load(valid, text::ru())?;
+        let mut engine = CognitiveEngine::from_model(&trainer.model)?;
+        println!("{}", text::evaluate_lm(&mut engine, train, &valid, 1000, 99)?);
+    }
     if meta.task == Task::Browser {
-        // Closed-loop quality: whole episodes in the simulated browser.
+        // Closed-loop quality: whole episodes in the simulated browser, for training wordings
+        // and for held-out wordings the model has never seen.
         let mut policy = EnginePolicy::new(CognitiveEngine::from_model(&trainer.model)?);
-        println!("agent {}", browsing::step_accuracy(&mut policy, 1000, 99)?);
-        let r = browsing::evaluate(&mut SimBrowser::new(), &mut policy, SIM_ORIGIN, 200, 99, 10)?;
-        println!("agent (200 episodes, simulated browser): {r}");
+        for (name, split) in [("train wordings", Split::Train), ("held-out wordings", Split::HeldOut)] {
+            println!("agent, {name}: {}", browsing::step_accuracy(&mut policy, 1000, 99, split)?);
+            let r =
+                browsing::evaluate(&mut SimBrowser::new(), &mut policy, &mut RustCalc, SIM_ORIGIN, 200, 99, split, 12)?;
+            println!("agent, {name} (200 episodes, simulated browser): {r}");
+        }
     }
     if demo {
         bench(&mut CognitiveEngine::from_model(&trainer.model)?, 200)?;
@@ -294,7 +382,9 @@ fn cmd_infer(a: &Args) -> Result<()> {
     let (out, g) = engine.generate(&prompt, a.num("seed", 0)?)?;
     println!("prompt : {}", fmt_task_tokens(meta.task, &prompt));
     println!("output : {}", fmt_task_tokens(meta.task, &out));
-    println!("target : {}   ({})", fmt_task_tokens(meta.task, &meta.task.apply(&prompt)), meta.task.name());
+    if let Some(target) = meta.task.apply(&prompt) {
+        println!("target : {}   ({})", fmt_task_tokens(meta.task, &target), meta.task.name());
+    }
     println!(
         "plan   : energy {:.4} (warm start {:.4}), ESS {:.1}{}",
         g.plan.energy,
@@ -420,7 +510,8 @@ async fn serve(engine: Arc<Mutex<CognitiveEngine>>, len: usize, addr: String) ->
 }
 
 /// `--policy model` (default, needs `--ckpt`) or `--policy expert` (the scripted teacher).
-fn agent_policy(a: &Args) -> Result<Box<dyn Policy>> {
+/// `trace` records the decoded latent reasoning of every decision.
+fn agent_policy(a: &Args, trace: bool) -> Result<Box<dyn Policy>> {
     match a.get("policy", "model").as_str() {
         "expert" => Ok(Box::new(ExpertPolicy)),
         "model" => {
@@ -428,7 +519,8 @@ fn agent_policy(a: &Args) -> Result<Box<dyn Policy>> {
             if meta.task != Task::Browser {
                 bail!("the checkpoint was trained on '{}', not 'browser' (train with --task browser)", meta.task.name())
             }
-            Ok(Box::new(EnginePolicy::new(engine)))
+            let policy = EnginePolicy::new(engine);
+            Ok(Box::new(if trace { policy.with_trace() } else { policy }))
         }
         other => bail!("unknown policy '{other}' (model | expert)"),
     }
@@ -444,6 +536,7 @@ fn agent_browser(a: &Args, default: &str) -> Result<(Box<dyn Browser>, String, O
             let opts = ChromeOptions {
                 executable: a.opts.get("chrome").map(Into::into),
                 headless: !a.opts.contains_key("headed"),
+                local_only: !a.opts.contains_key("allow-internet"),
                 ..Default::default()
             };
             let chrome = Chrome::launch(&opts)?;
@@ -453,54 +546,131 @@ fn agent_browser(a: &Args, default: &str) -> Result<(Box<dyn Browser>, String, O
     }
 }
 
+/// `--calc python` (a sandboxed `python3` worker) or `--calc rust` (its exact in-process
+/// mirror).
+fn agent_calculator(a: &Args, default: &str) -> Result<Box<dyn Calculator>> {
+    match a.get("calc", default).as_str() {
+        "python" | "py" => match PythonCalc::start() {
+            Ok(p) => {
+                println!("calculator: {} (sandboxed worker)", p.python().display());
+                Ok(Box::new(p))
+            }
+            Err(e) => {
+                println!("calculator: {e} — using the Rust mirror");
+                Ok(Box::new(RustCalc))
+            }
+        },
+        "rust" => Ok(Box::new(RustCalc)),
+        other => bail!("unknown calculator '{other}' (python | rust)"),
+    }
+}
+
 fn cmd_agent(a: &Args) -> Result<()> {
-    let question = a.get("question", "what is the price of the lamp?");
-    let goal = Goal::parse(&question)?;
+    let question = a.get("question", "Сколько стоит лампа?");
+    let goal = Goal { spec: goal::recognize(&question), text: question.clone() };
     let world: u64 = a.num("world", 42)?;
-    let mut policy = agent_policy(a)?;
+    let mut policy = agent_policy(a, true)?;
+    let mut calc = agent_calculator(a, "python")?;
     let (mut browser, origin, _server) = agent_browser(a, "chrome")?;
-    println!("question: {question}\ngoal    : {goal} | world {world} | site {origin}");
+    println!("question: {question}\nworld   : {world} | site {origin}");
+    let steps = a.num("max-steps", 12)?;
     let ep =
-        browsing::run_episode(browser.as_mut(), policy.as_mut(), &origin, world, goal, a.num("max-steps", 10)?, |s| {
-            let action = s.action.map_or_else(|| "?".to_string(), |x| x.to_string());
+        browsing::run_episode(browser.as_mut(), policy.as_mut(), calc.as_mut(), &origin, world, &goal, steps, |s| {
+            let action = s.action.as_ref().map_or_else(|| "?".to_string(), |x| x.to_string());
             println!("\n  {}", s.url);
-            println!("    sees   : {}", vocab::describe(&s.observation));
+            println!("    sees   : {}", obs::describe(&s.observation));
+            if let Some(r) = &s.thoughts {
+                print_reasoning(r);
+            } else if let Some(g) = &s.plan {
+                println!("    thinks : {}", g.plan);
+            }
             println!(
-                "    does   : {action:<24} ({:.1} ms){}",
+                "    does   : {action:<28} ({:.1} ms){}",
                 1e3 * s.think_time.as_secs_f64(),
                 s.error.as_ref().map(|e| format!("  ✗ {e}")).unwrap_or_default()
             );
+            if let Some((note, by)) = &s.tool {
+                println!("    tool   : {by}: {} = {}", note.expr, note.result);
+            }
         })?;
     println!();
-    match ep.answer {
-        Some(ans) => println!(
-            "answer  : {} {} (page says {}) in {} steps",
-            token_str(ans),
-            if ep.success() { "✓" } else { "✗" },
-            token_str(ep.truth),
-            ep.steps.len()
-        ),
-        None => println!("answer  : — (no answer in {} steps; the page says {})", ep.steps.len(), token_str(ep.truth)),
+    let verdict = match (ep.success(), ep.expected()) {
+        (Some(true), _) => "✓".to_string(),
+        (Some(false), Some(e)) => format!("✗ (expected {e})"),
+        _ => "(question not recognised: cannot check)".to_string(),
+    };
+    match &ep.answer {
+        Some(ans) => println!("answer  : {ans} {verdict} in {} steps", ep.steps.len()),
+        None => println!("answer  : — (no answer in {} steps) {verdict}", ep.steps.len()),
     }
     Ok(())
 }
 
+/// A decoded thought: the action it stands for, or its raw tokens.
+fn thought(tokens: &[u32]) -> String {
+    match cog_engine::browser::Action::decode(tokens, text::ru()) {
+        Some(a) => a.to_string(),
+        None => format!("⟨{}⟩", obs::describe(tokens)),
+    }
+}
+
+fn print_reasoning(r: &cog_engine::pipeline::Reasoning) {
+    println!("    thinks : {}{}", r.stats, if r.refined { " (+ latent GD)" } else { "" });
+    for (t, d) in r.depths.iter().enumerate() {
+        let pruned = d.best_pruned.map_or(String::new(), |p| format!(", best pruned {p:.4}"));
+        println!(
+            "             depth {}: {} hypotheses, kept energy {:.4}…{:.4}{pruned}",
+            t + 1,
+            d.expanded,
+            d.best_kept,
+            d.worst_kept
+        );
+    }
+    if !r.hypotheses.is_empty() {
+        let hyps: Vec<String> = r.hypotheses.iter().map(|(e, t)| format!("{} (E {e:.4})", thought(t))).collect();
+        println!("    leaves : {}", hyps.join(" | "));
+    }
+    if !r.chain.is_empty() {
+        let mut chain: Vec<(usize, String)> = Vec::new();
+        for (i, t) in r.chain.iter().enumerate() {
+            let s = thought(t);
+            if chain.last().map(|(_, l)| l) != Some(&s) {
+                chain.push((i, s));
+            }
+        }
+        let chain: Vec<String> = chain.into_iter().map(|(i, s)| format!("s{i}: {s}")).collect();
+        println!("    chain  : {}", chain.join(" → "));
+    }
+}
+
 fn cmd_agent_eval(a: &Args) -> Result<()> {
-    let mut policy = agent_policy(a)?;
+    let mut policy = agent_policy(a, false)?;
+    let mut calc = agent_calculator(a, "rust")?;
     let (mut browser, origin, _server) = agent_browser(a, "sim")?;
     let episodes = a.num("episodes", 100)?;
-    if a.opts.contains_key("steps") {
-        println!("{}", browsing::step_accuracy(policy.as_mut(), a.num("steps", 1000)?, a.num("seed", 1)?)?);
+    let seed = a.num("seed", 1)?;
+    let splits: Vec<(&str, Split)> = match a.get("split", "both").as_str() {
+        "train" => vec![("train wordings", Split::Train)],
+        "heldout" => vec![("held-out wordings", Split::HeldOut)],
+        "both" => vec![("train wordings", Split::Train), ("held-out wordings", Split::HeldOut)],
+        other => bail!("unknown split '{other}' (train | heldout | both)"),
+    };
+    for (name, split) in splits {
+        if a.opts.contains_key("steps") {
+            println!("{name}: {}", browsing::step_accuracy(policy.as_mut(), a.num("steps", 1000)?, seed, split)?);
+        }
+        let r = browsing::evaluate(
+            browser.as_mut(),
+            policy.as_mut(),
+            calc.as_mut(),
+            &origin,
+            episodes,
+            seed,
+            split,
+            a.num("max-steps", 12)?,
+        )?;
+        println!("{} | {} | {name}: {r}", a.get("policy", "model"), a.get("browser", "sim"));
     }
-    let r = browsing::evaluate(
-        browser.as_mut(),
-        policy.as_mut(),
-        &origin,
-        episodes,
-        a.num("seed", 1)?,
-        a.num("max-steps", 10)?,
-    )?;
-    println!("{} | {} | {r}", a.get("policy", "model"), a.get("browser", "sim"));
     Ok(())
 }
 
@@ -508,6 +678,88 @@ fn cmd_site(a: &Args) -> Result<()> {
     let server = SiteServer::start(&a.get("addr", "127.0.0.1:8080"))?;
     println!("sandbox web on {}/w/<world>/ (e.g. {}/w/42/) — Ctrl-C to stop", server.origin(), server.origin());
     server.wait();
+    Ok(())
+}
+
+/// Trains the byte-level BPE on a corpus plus the browsing task's texts (pages, wordings,
+/// actions and tool results), every text as a fragment with a leading space.
+fn cmd_tokenizer(a: &Args) -> Result<()> {
+    let corpus_path = a.get("corpus", "data/ru/train.txt");
+    let corpus = std::fs::read_to_string(&corpus_path)
+        .map_err(|e| candle_core::Error::Msg(format!("{corpus_path}: {e} (run scripts/fetch_ru_corpus.sh)")))?;
+    let vocab: usize = a.num("vocab", 1024)?;
+    let extra: usize = a.num("browser-texts", 20000)?;
+    let mut rng = cog_engine::kernels::rng::Rng::new(a.num("seed", 1)?);
+    let mut texts: Vec<String> = corpus.lines().map(String::from).collect();
+    for _ in 0..extra {
+        use cog_engine::browser::Action;
+        let (goal, snapshot, note, action) = cog_engine::browser::data::raw(&mut rng, Split::Train);
+        texts.push(goal.text);
+        texts.extend(snapshot.elements.into_iter().flat_map(|e| [e.text, e.value]));
+        if let Some(n) = note {
+            texts.push(format!("{} = {}", n.expr, n.result));
+        }
+        if let Action::Calc { text } | Action::Answer { text } = action {
+            texts.push(text);
+        }
+    }
+    let texts: Vec<String> =
+        texts.into_iter().map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).map(|t| format!(" {t}")).collect();
+    let t0 = Instant::now();
+    let bpe = Bpe::train(texts.iter().map(String::as_str), &text::SPECIALS, vocab)?;
+    let out = a.get("out", "models/tokenizer_ru.bpe");
+    bpe.save(&out)?;
+    let (bytes, tokens) =
+        corpus.lines().take(2000).fold((0, 0), |(b, t), l| (b + l.chars().count(), t + text::fragment(&bpe, l).len()));
+    println!(
+        "{out}: {} tokens ({} specials + 256 bytes + {} merges) in {:.1?}; corpus: {:.2} characters per token",
+        bpe.vocab_size(),
+        bpe.num_specials(),
+        bpe.num_merges(),
+        t0.elapsed(),
+        bytes as f64 / tokens.max(1) as f64
+    );
+    for s in [
+        "Сколько стоит лампа?",
+        "Что дешевле: клавиатура или мышь?",
+        "Найди товар дешевле 12 ₽.",
+        "Сколько будет 12 умножить на 3?",
+        "Привет! Чем помочь?",
+    ] {
+        println!("  {s:<36} → {}", bpe.describe(&text::fragment(&bpe, s)));
+    }
+    Ok(())
+}
+
+/// Text continuation accuracy of a checkpoint on held-out sentences, next to baselines.
+fn cmd_text_eval(a: &Args) -> Result<()> {
+    let (mut engine, meta) = load_engine(a)?;
+    if !meta.task.uses_text() {
+        bail!("the checkpoint was trained on '{}', not on text", meta.task.name())
+    }
+    let train = Corpus::load(a.get("corpus", "data/ru/train.txt"), text::ru())?;
+    let valid = Corpus::load(a.get("valid", "data/ru/valid.txt"), text::ru())?;
+    println!("{}", text::evaluate_lm(&mut engine, &train, &valid, a.num("n", 1000)?, a.num("seed", 99)?)?);
+    Ok(())
+}
+
+/// Text continuation: the next `L` tokens after `--text`.
+fn cmd_complete(a: &Args) -> Result<()> {
+    let (mut engine, meta) = load_engine(a)?;
+    if !meta.task.uses_text() {
+        bail!("the checkpoint was trained on '{}', not on text", meta.task.name())
+    }
+    let bpe = text::ru();
+    let n = engine.config().max_prompt_len;
+    let mut ctx = text::fragment(bpe, &a.get("text", "Москва — столица"));
+    ctx.truncate(n - 1);
+    let mut prompt = vec![text::PAD; n - 1 - ctx.len()];
+    prompt.push(text::TEXT);
+    prompt.extend(&ctx);
+    let (out, g) = engine.generate(&prompt, a.num("seed", 0)?)?;
+    let end = out.iter().position(|&t| bpe.is_special(t)).unwrap_or(out.len());
+    println!("{}⟦{}⟧", a.get("text", "Москва — столица"), bpe.decode(&out[..end]));
+    println!("tokens : {}\nplan   : {}", obs::describe(&out), g.plan);
     Ok(())
 }
 
@@ -522,6 +774,11 @@ fn main() -> Result<()> {
         "agent" => cmd_agent(&a),
         "agent-eval" => cmd_agent_eval(&a),
         "site" => cmd_site(&a),
-        other => bail!("unknown command '{other}' (demo | train | infer | bench | serve | agent | agent-eval | site)"),
+        "tokenizer" => cmd_tokenizer(&a),
+        "complete" => cmd_complete(&a),
+        "text-eval" => cmd_text_eval(&a),
+        other => bail!(
+            "unknown command '{other}' (demo | train | infer | bench | serve | agent | agent-eval | site | tokenizer | complete | text-eval)"
+        ),
     }
 }

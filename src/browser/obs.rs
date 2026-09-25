@@ -1,119 +1,98 @@
-//! Observation encoding: page snapshot + goal → a fixed-length token prompt, and back.
+//! Observation encoding: page snapshot + instruction (+ the last tool result) → a fixed-length
+//! prompt of BPE tokens.
 //!
 //! ```text
-//!  [head] results [input] lamp [button] search [link] sofa [link] lamp … <pad>… <goal> lamp price
-//!  └────────────────── page: role token + words, document order ─────┘        └── last 3 slots ──┘
+//!  [head] ␣Результаты [input] ␣лампа [button] ␣Найти [link] ␣стул [value] ␣1·2·␣₽ … <pad>… <goal> ␣Сколько·␣будет·␣1·2·+·3·0·? CALC ␣1·2·+·3·0·␣=·␣4·2
+//!  └──────────────── page: role token + text, document order ─────────────────┘         └──────────── instruction ───────────┘ └──── tool result ────┘
 //! ```
 //!
-//! Words outside the vocabulary become `<unk>`, an empty text field is `<empty>`. The page part
-//! is truncated to `OBS_LEN − 3` tokens; the goal always occupies the last three positions,
-//! so it sits at the same positional embeddings on every page.
+//! An empty text field is `<empty>`. The instruction (at most [`GOAL_MAX`] tokens) and the
+//! result of the last calculator call (at most [`NOTE_MAX`]) always end the observation, the
+//! newest information last, next to the readout of the TTT encoder; the page is truncated to
+//! the remaining space. Every text is a [`fragment`] (leading space), so a number reads the
+//! same on the page, in the question, in the tool result and in the answer.
 
-use super::vocab::{self, Goal, EMPTY, GOAL, PAD, UNK};
 use super::{PageSnapshot, Role};
+use crate::text::{self, fragment, Bpe, CALC, EMPTY, GOAL, PAD};
 
 /// Prompt length `N` of the browsing task.
-pub const OBS_LEN: usize = 24;
-/// Tokens available for the page.
-pub const PAGE_LEN: usize = OBS_LEN - 3;
+pub const OBS_LEN: usize = 128;
+/// Longest instruction kept, in tokens (including `<goal>`).
+pub const GOAL_MAX: usize = 32;
+/// Longest tool result kept, in tokens (including `CALC`).
+pub const NOTE_MAX: usize = 24;
 
-fn words(text: &str) -> impl Iterator<Item = u32> + '_ {
-    text.split_whitespace().map(|w| vocab::word_id(w).unwrap_or(UNK))
+/// What the last calculator call returned: the expression the agent sent and the printed
+/// result (a number, or «ошибка»). It stays in the observation for the rest of the episode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Note {
+    pub expr: String,
+    pub result: String,
 }
 
-/// Encodes what the agent sees.
-pub fn encode(snapshot: &PageSnapshot, goal: &Goal) -> [u32; OBS_LEN] {
-    let mut page = Vec::with_capacity(2 * snapshot.elements.len());
+impl Note {
+    /// The note of a calculator reply.
+    pub fn of(expr: &str, reply: &Result<String, crate::tools::CalcError>) -> Self {
+        let result = match reply {
+            Ok(v) => v.clone(),
+            Err(_) => "ошибка".to_string(),
+        };
+        Self { expr: expr.trim().to_string(), result }
+    }
+
+    /// Whether the note is the result of `expr` (spaces ignored).
+    pub fn is_for(&self, expr: &str) -> bool {
+        let squash = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+        squash(&self.expr) == squash(expr)
+    }
+}
+
+/// Page part of an observation (no truncation).
+pub fn page_tokens(snapshot: &PageSnapshot, bpe: &Bpe) -> Vec<u32> {
+    let mut page = Vec::with_capacity(8 * snapshot.elements.len());
     for e in &snapshot.elements {
         page.push(e.role.token());
         if e.role == Role::Input {
-            let before = page.len();
-            page.extend(words(&e.value));
-            if page.len() == before {
-                page.push(EMPTY);
-            }
+            let v = fragment(bpe, &e.value);
+            page.extend(if v.is_empty() { vec![EMPTY] } else { v });
         } else {
-            page.extend(words(&e.text));
+            page.extend(fragment(bpe, &e.text));
         }
     }
+    page
+}
+
+/// `<goal>` + instruction tokens (at most [`GOAL_MAX`]).
+pub fn goal_tokens(instruction: &str, bpe: &Bpe) -> Vec<u32> {
+    let mut g = vec![GOAL];
+    g.extend(fragment(bpe, instruction));
+    g.truncate(GOAL_MAX);
+    g
+}
+
+/// `CALC` + `expr = result` (at most [`NOTE_MAX`]; empty without a note).
+pub fn note_tokens(note: Option<&Note>, bpe: &Bpe) -> Vec<u32> {
+    let Some(n) = note else { return Vec::new() };
+    let mut t = vec![CALC];
+    t.extend(fragment(bpe, &format!("{} = {}", n.expr, n.result)));
+    t.truncate(NOTE_MAX);
+    t
+}
+
+/// Encodes what the agent sees.
+pub fn encode(snapshot: &PageSnapshot, instruction: &str, note: Option<&Note>) -> [u32; OBS_LEN] {
+    let bpe = text::ru();
+    let page = page_tokens(snapshot, bpe);
+    let mut tail = goal_tokens(instruction, bpe);
+    tail.extend(note_tokens(note, bpe));
     let mut out = [PAD; OBS_LEN];
-    let n = page.len().min(PAGE_LEN);
+    let n = page.len().min(OBS_LEN - tail.len());
     out[..n].copy_from_slice(&page[..n]);
-    out[PAGE_LEN..].copy_from_slice(&goal.tokens());
+    out[OBS_LEN - tail.len()..].copy_from_slice(&tail);
     out
 }
 
-/// A decoded observation: elements as `(role, words)` plus the goal.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ObsView {
-    pub elements: Vec<(Role, Vec<u32>)>,
-    pub goal: Option<Goal>,
-}
-
-impl ObsView {
-    /// Words of the first element with `role`.
-    pub fn first(&self, role: Role) -> Option<&[u32]> {
-        self.elements.iter().find(|(r, _)| *r == role).map(|(_, w)| w.as_slice())
-    }
-
-    /// Whether some element with `role` consists of exactly `word`.
-    pub fn has(&self, role: Role, word: u32) -> bool {
-        self.elements.iter().any(|(r, w)| *r == role && w.as_slice() == [word])
-    }
-}
-
-/// Inverse of [`encode`] (up to truncation and `<unk>`).
-pub fn parse(tokens: &[u32]) -> ObsView {
-    let (page, goal) = match tokens.iter().rposition(|&t| t == GOAL) {
-        Some(i) => (&tokens[..i], &tokens[i + 1..]),
-        None => (tokens, &[][..]),
-    };
-    let goal = match goal {
-        &[item, attr, ..] if vocab::is_item(item) && vocab::is_attr(attr) => Some(Goal { item, attr }),
-        _ => None,
-    };
-    let mut elements: Vec<(Role, Vec<u32>)> = Vec::new();
-    for &t in page {
-        if let Some(role) = Role::from_token(t) {
-            elements.push((role, Vec::new()));
-        } else if let Some((_, w)) = elements.last_mut() {
-            if t != PAD && t != EMPTY {
-                w.push(t);
-            }
-        }
-    }
-    ObsView { elements, goal }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::browser::world::World;
-
-    #[test]
-    fn encode_parse_round_trip() {
-        let goal = Goal::parse("price of lamp").unwrap();
-        for path in ["/w/1/", "/w/1/search?q=lamp", "/w/1/item/lamp", "/w/1/item/sofa", "/nope"] {
-            let page = World::page_at(path);
-            let snap = PageSnapshot {
-                url: path.into(),
-                title: page.title(),
-                elements: page.nodes().into_iter().map(|n| n.element).collect(),
-            };
-            let obs = encode(&snap, &goal);
-            assert_eq!(&obs[PAGE_LEN..], &goal.tokens());
-            let view = parse(&obs);
-            assert_eq!(view.goal, Some(goal));
-            assert_eq!(view.elements.len(), snap.elements.len(), "{path}: {}", vocab::describe(&obs));
-            for ((role, w), e) in view.elements.iter().zip(&snap.elements) {
-                assert_eq!(*role, e.role);
-                let text = if e.role == Role::Input { &e.value } else { &e.text };
-                let expect: Vec<u32> = words(text).collect();
-                assert_eq!(w, &expect);
-            }
-        }
-        // every sandbox page fits into the observation
-        let longest = World::page_at("/w/1/item/lamp").nodes().len() * 2;
-        assert!(longest <= PAGE_LEN);
-    }
+/// Readable form of an observation or action (BPE pieces separated by `·`).
+pub fn describe(tokens: &[u32]) -> String {
+    text::ru().describe(tokens)
 }

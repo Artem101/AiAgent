@@ -26,6 +26,7 @@ pub use planner::{GradientPlan, GradientPlanner, JEPAPlanner, MppiWorkspace, Pla
 pub use world_model::{PackedWorldModel, WorldModel};
 
 use crate::config::{EngineConfig, JepaConfig};
+use crate::copy::CopyHead;
 use crate::kernels::PackedMlp;
 use crate::nn::{self, Lin, Mlp, ParamStore};
 use vicreg::VicRegLoss;
@@ -39,8 +40,11 @@ pub struct Jepa {
     pub inverse: Mlp,
     pub goal: Mlp,
     pub policy: Mlp,
-    /// Answer probe `s_0 → [L · vocab]` logits (training only; see `JepaConfig::probe_weight`).
+    /// Thought probe `s → [L, d_token]`: a latent state read in the token-embedding space of
+    /// the decoder, unembedded by the shared head (see `JepaConfig::probe_weight`).
     pub probe: Option<Lin>,
+    /// Copy mechanism of the probe (see [`crate::copy`], `JepaConfig::copy_dim`).
+    pub copy: Option<CopyHead>,
 }
 
 /// Individual (unweighted) JEPA loss terms.
@@ -76,10 +80,11 @@ impl Jepa {
             goal: online.mlp("jepa.goal", j.d_state, j.d_hidden, j.d_state)?,
             policy: online.mlp("jepa.policy", 2 * j.d_state, j.d_hidden, j.d_action)?,
             probe: if j.probe_weight > 0.0 {
-                Some(online.linear("jepa.probe", j.d_state, cfg.answer_len() * cfg.vocab_size, true)?)
+                Some(online.linear("jepa.probe", j.d_state, cfg.answer_len() * cfg.flow.d_token, true)?)
             } else {
                 None
             },
+            copy: if j.copy_dim > 0 { Some(CopyHead::new(online, cfg.flow.d_token, j.copy_dim)?) } else { None },
         };
         Self::ema(online, target, 0.0)?; // Ē ← E
         Ok(jepa)

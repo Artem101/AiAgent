@@ -18,6 +18,10 @@ pub struct TttProjections {
     pub q: Tensor,
     /// `[B, T, 1]` inner learning rate η_t.
     pub eta: Tensor,
+    /// `[B, T, P]` readout-pool gates `σ(w·x̃_t + b)` (when pools are enabled).
+    pub gate: Option<Tensor>,
+    /// `[B, T, w·d_model]` causal windows `x̃_t` the projections were computed from.
+    pub window: Tensor,
 }
 
 /// Snapshot of the recurrent state after a prefix.
@@ -28,7 +32,15 @@ pub struct TttSnapshot {
     pub z_mean: Tensor,
     /// The last outputs, newest first (`z_T, z_{T−1}, …`, zeros before the start), `[B, d]` each.
     pub z_last: Vec<Tensor>,
+    /// Gated pools `Σ g z / (Σ g + ε)`, `[B, P·d]` (when pools are enabled).
+    pub z_pool: Option<Tensor>,
 }
+
+/// Causal windows `[B, n, w·d_model]` and layer outputs `[B, n, d_fast]` of the first `n` tokens.
+pub type WindowsAndOutputs = (Tensor, Tensor);
+
+/// Denominator guard of the gated pools (shared by both paths).
+pub const POOL_EPS: f64 = 1e-6;
 
 /// `[LN(x_t); LN(x_{t−1}); …]` for a causal window of `w` tokens (zeros before the start):
 /// `xn: [B, T, d]` → `[B, T, w·d]`.
@@ -55,6 +67,8 @@ pub struct TttLinear {
     pub adaptive: bool,
     /// Causal window width `w` (the projections take `w · d_model` inputs).
     pub conv_width: usize,
+    /// Gates of the readout pools (`P` outputs), if any.
+    pub pool_gate: Option<Lin>,
 }
 
 impl TttLinear {
@@ -68,7 +82,17 @@ impl TttLinear {
             eta: cfg.learning_rate,
             adaptive: cfg.adaptive_lr,
             conv_width: cfg.conv_width,
+            pool_gate: if cfg.readout_pools > 0 {
+                Some(ps.linear(&format!("{name}.pool_gate"), d_in, cfg.readout_pools, true)?)
+            } else {
+                None
+            },
         })
+    }
+
+    /// Number of readout pools.
+    pub fn pools(&self) -> usize {
+        self.pool_gate.as_ref().map_or(0, |g| g.d_out())
     }
 
     pub fn d_fast(&self) -> usize {
@@ -86,13 +110,27 @@ impl TttLinear {
         } else {
             (xn.narrow(2, 0, 1)?.zeros_like()? + self.eta)?
         };
-        Ok(TttProjections { k, v, q, eta })
+        let gate = self.pool_gate.as_ref().map(|g| candle_nn::ops::sigmoid(&g.forward(&xn)?)).transpose()?;
+        Ok(TttProjections { k, v, q, eta, gate, window: xn })
     }
 
     /// Runs the online-GD recurrence over `x: [B, T, d_model]` starting from `W = 0` and
     /// returns the state after each prefix length in `snapshots` (ascending, ≤ T), keeping the
     /// last `last` outputs in each snapshot.
     pub fn scan(&self, x: &Tensor, snapshots: &[usize], last: usize) -> Result<Vec<TttSnapshot>> {
+        Ok(self.scan_with_outputs(x, snapshots, last, 0)?.0)
+    }
+
+    /// [`TttLinear::scan`] that also returns, for the first `keep` tokens, their causal windows
+    /// `[B, keep, w·d_model]` and layer outputs `[B, keep, d_fast]` (the inputs of the copy
+    /// keys); `None` when `keep = 0`.
+    pub fn scan_with_outputs(
+        &self,
+        x: &Tensor,
+        snapshots: &[usize],
+        last: usize,
+        keep: usize,
+    ) -> Result<(Vec<TttSnapshot>, Option<WindowsAndOutputs>)> {
         let (b, t_len, _) = x.dims3()?;
         let p = self.project(x)?;
         let d = self.d_fast();
@@ -100,30 +138,63 @@ impl TttLinear {
         let zeros = Tensor::zeros((b, d), x.dtype(), x.device())?;
         let mut z_sum = zeros.clone();
         let mut recent = vec![zeros; last]; // newest first
+        let np = self.pools();
+        let (mut pool_num, mut pool_den) =
+            (Tensor::zeros((b, np, d), x.dtype(), x.device())?, Tensor::zeros((b, np), x.dtype(), x.device())?);
+        let pooled = |num: &Tensor, den: &Tensor| -> Result<Option<Tensor>> {
+            if np == 0 {
+                return Ok(None);
+            }
+            Ok(Some(num.broadcast_div(&(den + POOL_EPS)?.unsqueeze(2)?)?.reshape((b, np * d))?))
+        };
         let mut out = Vec::with_capacity(snapshots.len());
+        let mut kept = Vec::with_capacity(keep);
         let mut next = snapshots.iter().peekable();
         while next.peek() == Some(&&0) {
-            out.push(TttSnapshot { w: w.clone(), z_mean: z_sum.clone(), z_last: recent.clone() });
+            let z_pool = pooled(&pool_num, &pool_den)?;
+            out.push(TttSnapshot { w: w.clone(), z_mean: z_sum.clone(), z_last: recent.clone(), z_pool });
             next.next();
         }
         for t in 0..t_len {
             let at = |m: &Tensor| m.narrow(1, t, 1)?.squeeze(1);
             w = batched_step(&w, &at(&p.k)?, &at(&p.v)?, &at(&p.eta)?)?;
             let z = batched_apply(&w, &at(&p.q)?)?;
+            if t < keep {
+                kept.push(z.clone());
+            }
             z_sum = (z_sum + &z)?;
+            if let Some(gate) = &p.gate {
+                let g = at(gate)?; // [B, P]
+                pool_num = (pool_num + g.unsqueeze(2)?.broadcast_mul(&z.unsqueeze(1)?)?)?;
+                pool_den = (pool_den + g)?;
+            }
             if last > 0 {
                 recent.pop();
                 recent.insert(0, z);
             }
             while next.peek() == Some(&&(t + 1)) {
-                out.push(TttSnapshot { w: w.clone(), z_mean: (&z_sum / (t + 1) as f64)?, z_last: recent.clone() });
+                let z_pool = pooled(&pool_num, &pool_den)?;
+                out.push(TttSnapshot {
+                    w: w.clone(),
+                    z_mean: (&z_sum / (t + 1) as f64)?,
+                    z_last: recent.clone(),
+                    z_pool,
+                });
                 next.next();
             }
         }
         if out.len() != snapshots.len() {
             candle_core::bail!("TTT scan: snapshot positions {snapshots:?} must be ascending and ≤ {t_len}")
         }
-        Ok(out)
+        let outputs = if keep > 0 {
+            if kept.len() != keep {
+                candle_core::bail!("TTT scan: cannot keep {keep} outputs of {t_len} tokens")
+            }
+            Some((p.window.narrow(1, 0, keep)?, Tensor::stack(&kept, 1)?))
+        } else {
+            None
+        };
+        Ok((out, outputs))
     }
 
     /// Layer outputs `z_t = W_t q_t` for every token, `[B, T, d_fast]`.
@@ -150,6 +221,7 @@ impl TttLinear {
             eta: self.eta as f32,
             adaptive: self.adaptive,
             conv_width: self.conv_width,
+            pool_gate: self.pool_gate.as_ref().map(|g| g.pack(dtype)).transpose()?,
         })
     }
 }
@@ -164,9 +236,24 @@ pub struct PackedTttLinear {
     pub eta: f32,
     pub adaptive: bool,
     pub conv_width: usize,
+    pub pool_gate: Option<PackedLinear>,
 }
 
 impl PackedTttLinear {
+    /// Number of readout pools.
+    pub fn pools(&self) -> usize {
+        self.pool_gate.as_ref().map_or(0, |g| g.d_out)
+    }
+
+    /// Readout-pool gates `σ(w·x̃ + b)` of one token's causal window.
+    #[inline]
+    pub fn gates(&self, xn: &[f32], out: &mut [f32]) {
+        if let Some(g) = &self.pool_gate {
+            g.forward(xn, out);
+            out.iter_mut().for_each(|v| *v = sigmoid(*v));
+        }
+    }
+
     pub fn d_model(&self) -> usize {
         self.wk.d_in / self.conv_width
     }
@@ -193,6 +280,10 @@ impl PackedTttLinear {
     }
 
     pub fn bytes(&self) -> usize {
-        self.wk.bytes() + self.wv.bytes() + self.wq.bytes() + self.eta_gate.bytes()
+        self.wk.bytes()
+            + self.wv.bytes()
+            + self.wq.bytes()
+            + self.eta_gate.bytes()
+            + self.pool_gate.as_ref().map_or(0, |g| g.bytes())
     }
 }

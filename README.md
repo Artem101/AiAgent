@@ -15,42 +15,31 @@ tokens ─► TTT-Encoder ─► S_prompt ─► E_θ ─► s_0 ─► JEPA-п�
 * Всё детерминировано: собственный seeded RNG, у каждого MPPI-сэмпла свой поток `(seed, iter, m)`,
   поэтому результат бит-в-бит совпадает при любом числе потоков.
 
-## Агент-браузер
+## Агент-браузер с калькулятором
 
-Движок умеет **искать информацию в настоящем браузере**. Модель смотрит на страницу в headless
-Chromium, решает, что сделать (ввести запрос, нажать кнопку, открыть ссылку, вернуться назад), и
-отвечает, когда нашла нужное. Обученная модель лежит в `models/browser_agent.safetensors`.
+Движок умеет **искать информацию в настоящем браузере и считать**. Вопрос задаётся по-русски
+свободным текстом. Модель смотрит на страницу в headless Chromium, перед каждым действием
+рассуждает в латентном пространстве (дерево гипотез глубиной 8, MPPI, latent GD) и решает, что
+сделать: ввести запрос, нажать кнопку, открыть ссылку, вернуться назад, **посчитать на Python**
+или ответить. Обученная модель лежит в `models/browser_agent.safetensors`.
 
 ```bash
-cargo run --release -- agent --ckpt models/browser_agent.safetensors --question "Сколько стоит лампа?"
+cargo run --release -- agent --ckpt models/browser_agent.safetensors --question "Сколько стоят вместе лампа и стул?"
 ```
 
-```
-  http://127.0.0.1:43293/w/42/
-    sees   : [head] search [input] <empty> [button] search <goal> lamp price
-    does   : TYPE "lamp"              (5.7 ms)
+AGENT_TRANSCRIPT
 
-  http://127.0.0.1:43293/w/42/
-    sees   : [head] search [input] lamp [button] search <goal> lamp price
-    does   : CLICK button "search"    (6.8 ms)
+AGENT_NUMBERS
 
-  http://127.0.0.1:43293/w/42/search?q=lamp
-    sees   : [head] results [input] lamp [button] search [link] bike [link] lamp [link] laptop [link] jacket [link] home <goal> lamp price
-    does   : CLICK link "lamp"        (6.1 ms)
+Факты на сайте-песочнице случайны для каждого «мира», поэтому ответ нельзя запомнить, его нужно
+найти и прочитать. Chromium управляется собственным CDP-клиентом (WebSocket + JSON-RPC, без
+новых тяжёлых зависимостей). Модель учится на симуляторе, который совпадает с Chromium элемент в
+элемент (это проверяет тест). Арифметику считает изолированный `python3` (разбор `ast`, белый
+список узлов, лимиты, таймаут); для обучения используется его точное зеркало на Rust.
 
-  http://127.0.0.1:43293/w/42/item/lamp
-    sees   : [head] lamp [link] home [label] brand [value] delta [label] price [value] 10 [label] color [value] blue [label] rating [value] 5 <goal> lamp price
-    does   : ANSWER "10"              (5.7 ms)
-
-answer  : 10 ✓ (page says 10) in 4 steps
-```
-
-**98.2% верных ответов на 500 новых задачах в настоящем Chromium** (4 шага на задачу, ~6 мс на
-решение модели). Факты на сайте-песочнице случайны для каждого «мира», поэтому ответ нельзя
-запомнить, его нужно найти и прочитать. Chromium управляется собственным CDP-клиентом
-(WebSocket + JSON-RPC, без новых тяжёлых зависимостей). Модель учится на симуляторе, который
-совпадает с Chromium элемент в элемент (это проверяет тест). Подробности, ограничения и что
-пришлось изменить в движке — в [docs/browser.md](docs/browser.md).
+Подробности: [docs/browser.md](docs/browser.md) (агент), [docs/calculator.md](docs/calculator.md)
+(калькулятор), [docs/reasoning.md](docs/reasoning.md) (русский язык, латентное рассуждение,
+сходимость, примеры), [docs/konspekt.md](docs/konspekt.md) (конспект всей работы).
 
 ## Документация
 
@@ -67,6 +56,9 @@ answer  : 10 ✓ (page says 10) in 4 steps
 | [runtime.md](docs/runtime.md) | арена, «0 аллокаций», точность, SIMD, параллелизм, детерминизм, скорость |
 | [development.md](docs/development.md) | тесты, инварианты, рецепты расширения, ограничения |
 | [browser.md](docs/browser.md) | агент-браузер: Chromium, песочница, наблюдения и действия, обучение, результаты |
+| [calculator.md](docs/calculator.md) | калькулятор на Python: безопасность, зеркало на Rust, как агент им пользуется |
+| [reasoning.md](docs/reasoning.md) | русский BPE, латентное рассуждение, копирование, сходимость, примеры рассуждений |
+| [konspekt.md](docs/konspekt.md) | конспект: что сделано на каждом шаге, результаты, ограничения, как запустить |
 
 Примеры: `cargo run --release --example quickstart` (обучение → инференс) и
 `cargo run --release --example staged` (API по стадиям).
@@ -139,8 +131,21 @@ answer  : 10 ✓ (page says 10) in 4 steps
 * **Вспомогательные потери декодера.** CE по одношаговой оценке `x̂_1 = X_t + (1−t)v_θ` и CE головы на
   зашумлённых чистых эмбеддингах. Цели `X_1` — замороженная случайная таблица эмбеддингов (обучаемые
   цели в CFM склонны к коллапсу).
+* **Проба мыслей, латентное дерево и копирование** (для агента-браузера). Линейная голова читает
+  любое латентное состояние как ответ и служит декодером действий; перед MPPI идёт дерево гипотез
+  глубины `H = 8` с отсечением; мысль может указывать на токены промпта вместо их выписывания
+  ([docs/reasoning.md](docs/reasoning.md), [docs/architecture.md](docs/architecture.md#копирование-из-контекста)).
 
 ### Отклонения от спецификации (честно)
+
+* **Память копирования растёт с длиной промпта.** В конфигурации агента-браузера энкодер, кроме
+  `W_fast`, хранит ключ на каждую позицию промпта (`128 × 32` чисел), чтобы декодер мог
+  копировать числа и слова из контекста. Это небольшой аналог KV-кэша, ограниченный
+  `max_prompt_len`. По умолчанию (`jepa.copy_dim = 0`) его нет, и память контекста остаётся
+  `O(d²)`.
+* **Действия агента декодирует проба, а не CFM.** На задачах с открытым словарём CFM-декодер
+  заметно уступал пробе мыслей (37.5% против 58.9% точных шагов), поэтому агент по умолчанию
+  использует пробу; CFM обучается вместе со всем и доступен флагом `--decoder flow`.
 
 * `VectorFieldEstimator` принимает `&mut self` и пишет результат в `out: &mut Tensor`
   (`estimate_velocity_into`), а также имеет `prepare(plan)`. Иначе оценщик не может переиспользовать
@@ -191,13 +196,14 @@ cargo run --release -- infer --ckpt model.safetensors --prompt "3 1 4 1 5 9 2 6"
 cargo run --release -- bench --ckpt model.safetensors
 cargo run --release -- serve --ckpt model.safetensors --addr 127.0.0.1:7878   # одна строка токенов → одна строка ответа
 
-# агент-браузер
-RAYON_NUM_THREADS=1 cargo run --release -- train --task browser --steps 8000 --out agent.safetensors   # ~12 мин
-cargo run --release -- agent --ckpt agent.safetensors --question "какого цвета велосипед"
+# агент-браузер с калькулятором (корпус для примеси текста: scripts/fetch_ru_corpus.sh)
+RAYON_NUM_THREADS=1 cargo run --release -- train --task browser --preset small --corpus data/ru/train.txt \
+    --valid data/ru/valid.txt --text-mix 0.2 --steps 9000 --save-every 1000 --out agent.safetensors   # ~5 ч на CPU
+cargo run --release -- agent --ckpt agent.safetensors --question "Сколько будет 12 умножить на 3?"
 cargo run --release -- agent-eval --ckpt agent.safetensors --browser chrome --episodes 200
 ```
 
-Задачи: `sort`, `reverse`, `copy`, `browser`. Пресеты: `tiny`, `small`. Точность: `--compute auto|f32|f16|bf16`.
+Задачи: `sort`, `reverse`, `copy`, `browser`, `text`. Пресеты: `tiny`, `small`. Точность: `--compute auto|f32|f16|bf16`.
 Устройство обучения: `--device cpu|cuda`.
 
 Как библиотека:
@@ -213,21 +219,27 @@ let gen = engine.generate_into(&[3, 1, 4, 1, 5, 9, 2, 6], /*seed*/ 0, &mut out)?
 
 ## Тесты
 
-`cargo test` — 41 тест:
-* **паритет graph ↔ kernel**: TTT-энкодер, векторное поле DiT (f32 и bf16), роллаут world model,
-  фьюзнутый rank-1 шаг против эталонного кода из спецификации, `dot/dot4` SIMD против portable-версии;
+`cargo test` — 50 тестов:
+* **паритет graph ↔ kernel**: TTT-энкодер (с окном, пулами и памятью копирования), векторное поле
+  DiT (f32 и bf16), роллаут world model, смесь словаря и указателей копирования, фьюзнутый rank-1
+  шаг против эталонного кода из спецификации, `dot/dot4` SIMD против portable-версии;
 * **математика**: порядок сходимости Euler/Midpoint/Heun, концы OT-пути, VICReg штрафует коллапс
   и корреляцию, EMA, `fast_tanh`;
-* **MPPI**: снижает энергию, бит-в-бит детерминирован при параллельном и последовательном
-  исполнении, latent GD улучшает решение;
+* **MPPI и латентное дерево**: снижают энергию, бит-в-бит детерминированы при параллельном и
+  последовательном исполнении, дерево не хуже жадной цепочки, latent GD улучшает решение;
 * **`tests/zero_alloc.rs`**: 0 аллокаций в `step_update` (10 000 шагов), `FlowMatchingSampler`,
-  `plan_into` и полном `generate_into` — последовательно и под rayon;
+  `plan_into` и полном `generate_into` (в том числе с деревом, пробой и копированием) —
+  последовательно и под rayon;
 * **`tests/pipeline.rs`**: обучение снижает loss, чекпойнт восстанавливается бит-в-бит,
   генерация детерминирована, память контекста не растёт на промпте из 500 токенов;
-* **агент-браузер** (`src/browser/*`, `tests/browser.rs`): словарь, действия и разбор вопросов;
-  миры, маршруты и HTTP-сервер; кадры WebSocket; учитель решает 300 задач и выходит из ошибок;
-  **снимки симулятора и Chromium совпадают элемент в элемент**; обученный движок управляет
-  обоими браузерами. Тесты с Chromium пропускаются, если браузер не найден.
+* **токенизатор и текст**: BPE обратим на любом тексте, поставляемый словарь на месте;
+* **калькулятор**: точная арифметика; изолированный `python3` и зеркало на Rust совпадают на
+  3000 случайных выражениях, включая ошибки;
+* **агент-браузер** (`src/browser/*`, `tests/browser.rs`): действия и разбор вопросов; миры,
+  маршруты и HTTP-сервер; кадры WebSocket; учитель решает 600 задач шести семейств, выходит из
+  ошибок и считает калькулятором; **снимки симулятора и Chromium совпадают элемент в элемент**;
+  обученный движок управляет обоими браузерами. Тесты с Chromium пропускаются, если браузер не
+  найден, тест с Python — если нет `python3`.
 
 ## Структура
 
@@ -235,7 +247,7 @@ let gen = engine.generate_into(&[3, 1, 4, 1, 5, 9, 2, 6], /*seed*/ 0, &mut out)?
 AiAgent/                         # корень репозитория = крейт cog_engine
 ├── Cargo.toml
 ├── src/
-│   ├── lib.rs, main.rs          # библиотека и CLI (demo/train/infer/bench/serve/agent/agent-eval/site)
+│   ├── lib.rs, main.rs          # библиотека и CLI (demo/train/infer/bench/serve/agent/agent-eval/site/tokenizer/complete/text-eval)
 │   ├── config.rs                # TTT/JEPA/Planner/Flow/Train конфиги, пресеты
 │   ├── types.rs                 # NewType: PromptState, LatentState, LatentPlan, FlowState
 │   ├── arena.rs                 # предвыделенные буферы и тензоры
@@ -244,12 +256,17 @@ AiAgent/                         # корень репозитория = кре�
 │   ├── ttt/{mod,fast_weights,layer}.rs
 │   ├── jepa/{mod,world_model,vicreg,planner}.rs
 │   ├── flow/{mod,vector_field,ode_solver}.rs
+│   ├── copy.rs                  # копирование из контекста для пробы мыслей (указатели со сдвигом)
 │   ├── model.rs                 # совместная функция потерь, save/load
 │   ├── train.rs                 # AdamW, warmup+cosine, clip, EMA, оценка с абляциями
-│   ├── data.rs                  # задачи: sort/reverse/copy и browser
-│   ├── pipeline.rs              # CognitiveEngine: Tokens → TTT → JEPA → CFM → Tokens
-│   └── browser/                 # агент-браузер: chrome+cdp, world+server, sim, obs, vocab, expert, data, agent
+│   ├── data.rs                  # задачи: sort/reverse/copy, browser и text
+│   ├── pipeline.rs              # CognitiveEngine: Tokens → TTT → JEPA → CFM/проба → Tokens, трасса рассуждения
+│   ├── text/{mod,bpe}.rs        # байтовый BPE, спецтокены, корпус и оценка продолжения текста
+│   ├── tools/{mod,calc,python}.rs   # калькулятор: точная арифметика и изолированный python3
+│   └── browser/                 # агент-браузер: chrome+cdp, world+server, sim, goal, obs, action, expert, data, agent
+├── models/tokenizer_ru.bpe      # русский BPE-токенизатор (1024 токена), компилируется в бинарник
 ├── models/browser_agent.safetensors   # обученный агент-браузер (+ .cfg)
+├── scripts/                     # fetch_ru_corpus.sh (корпус UD Russian), convergence_svg.py (графики)
 ├── examples/{quickstart,staged,browser_agent}.rs
 └── tests/{zero_alloc,pipeline,browser}.rs
 ```

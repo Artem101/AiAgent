@@ -1,67 +1,99 @@
-//! Web-browsing agent: the engine reads a web page, decides on an action, and a real browser
-//! (headless Chromium over the DevTools protocol) executes it — until the model answers.
+//! Web-browsing agent: the engine reads a web page and a Russian instruction, reasons in
+//! latent space, decides on an action, and a real browser (headless Chromium over the DevTools
+//! protocol) executes it — until the model answers.
 //!
 //! ```text
-//!   ┌──────────── Browser (Chromium via CDP, or the DOM-identical simulator) ───────────┐
-//!   │  page ──snapshot──► [role, words]… + <goal> item attr ──► CognitiveEngine          │
-//!   │   ▲                        (observation, 24 tokens)          (TTT → JEPA → CFM)    │
-//!   │   └──── click / type / back ◄── Action  [verb, role, word, <end>] ◄─────┘          │
-//!   └─────────────────────────────────── … until ANSWER ─────────────────────────────────┘
+//!   ┌──────────── Browser (Chromium via CDP, or the DOM-identical simulator) ─────────────────┐
+//!   │  page ──snapshot──► [role] BPE-text … <goal> «Что дешевле: лампа или стул?»             │
+//!   │   ▲                       (observation, 96 tokens)                                      │
+//!   │   │                                  ▼                                                  │
+//!   │   │        CognitiveEngine: TTT → latent reasoning (tree + MPPI + latent GD, H = 8) → CFM│
+//!   │   └──── click / type / back ◄── Action [verb, role, text…, <end>] (8 tokens) ◄──┘       │
+//!   └──────────────────────────────── … until ANSWER ─────────────────────────────────────────┘
 //! ```
 //!
-//! * [`world`] — the sandbox web: a search engine and product pages whose facts are drawn
-//!   from a per-world seed, so answers cannot be memorised and must be looked up;
+//! * [`world`] — the sandbox web: a Russian shop with search and a paged catalogue whose facts
+//!   are drawn from a per-world seed, so answers cannot be memorised and must be looked up;
+//! * [`goal`] — task specs (lookup, compare, filter, calc, total, chat) and their Russian wordings;
 //! * [`server`] — serves the sandbox web over HTTP for the real browser;
-//! * [`chrome`] / [`cdp`] — Chromium launcher and a dependency-free DevTools client
-//!   (WebSocket + JSON-RPC);
+//! * [`chrome`] / [`cdp`] — Chromium launcher and a dependency-free DevTools client;
 //! * [`sim`] — an in-process browser over the same pages (fast training data, tests);
-//! * [`obs`] — page snapshot + goal → observation tokens (and back);
+//! * [`obs`] / [`action`] — observations and actions as BPE token sequences ([`crate::text::ru`]);
+//!   `CALC` actions go to the calculator tool ([`crate::tools`]), its result shows up in the next
+//!   observation;
 //! * [`expert`] — scripted teacher used for behaviour cloning;
 //! * [`agent`] — the observe → act loop, episodes and success-rate evaluation;
-//! * [`data`] — random browser states labelled by the expert (`--task browser`).
+//! * [`data`] — random browser states labelled by the teacher (`--task browser`).
 //!
 //! The same [`Browser`] trait is implemented by [`chrome::Chrome`] and [`sim::SimBrowser`];
 //! `tests/browser.rs` checks that both produce identical snapshots along whole episodes.
 
+pub mod action;
 pub mod agent;
 pub mod cdp;
 pub mod chrome;
 pub mod data;
 pub mod expert;
+pub mod goal;
 pub mod obs;
 pub mod server;
 pub mod sim;
-pub mod vocab;
 pub mod world;
 
 use candle_core::Result;
 
-use crate::config::EngineConfig;
+use crate::config::{EngineConfig, PlannerKind};
 
+pub use action::{Action, ACTION_LEN};
 pub use agent::{run_episode, EnginePolicy, Episode, ExpertPolicy, Policy};
 pub use chrome::Chrome;
+pub use goal::{Family, Goal, Spec, Split};
 pub use obs::OBS_LEN;
 pub use server::SiteServer;
 pub use sim::SimBrowser;
-pub use vocab::{Action, Goal, ACTION_LEN, VOCAB_SIZE};
 pub use world::World;
 
-/// TTT causal window used for browsing: at a value cell the window `[value, [value], label,
-/// [label]]` lets one fast-weight update bind the attribute name to its value.
+/// TTT causal window used for browsing: at a value cell the window covers the value, its role
+/// token and the label before it, so one fast-weight update binds the label to the value.
 pub const CONV_WIDTH: usize = 4;
-/// Final TTT outputs in the readout: the three goal tokens at the end of the observation act as
-/// queries into the page stored in `W_fast`.
-pub const READOUT_LAST: usize = 3;
-
+/// Final TTT outputs in the readout: the last instruction tokens act as queries into the page
+/// stored in `W_fast`.
+pub const READOUT_LAST: usize = 4;
+/// Gated readout pools: position-independent selection of the informative words of the
+/// instruction (and the page).
+pub const READOUT_POOLS: usize = 4;
 /// Weight of the answer probe on `s_0` (see `JepaConfig::probe_weight`).
 pub const PROBE_WEIGHT: f64 = 1.0;
+/// Key width of the probe's copy mechanism: thoughts point at the words and digits of the page,
+/// the question and the tool result instead of spelling them out (see [`crate::copy`]).
+pub const COPY_DIM: usize = 32;
+/// Latent planning horizon: one latent thought step per two action tokens.
+pub const HORIZON: usize = 8;
+/// Thoughts the probe is trained on per step: `s_0`, `s_H` and one random intermediate one
+/// (see `TrainConfig::probe_states`).
+pub const PROBE_STATES: usize = 3;
+/// Latent tree search: hypotheses kept per depth (beam) and proposals per hypothesis.
+pub const TREE_BEAM: usize = 4;
+pub const TREE_BRANCH: usize = 4;
 
-/// Engine configuration for the browsing task (`preset` = `tiny` | `small`).
+/// Vocabulary size of the browsing task (the Russian BPE tokenizer).
+pub fn vocab_size() -> usize {
+    crate::text::ru().vocab_size()
+}
+
+/// Engine configuration for the browsing task (`preset` = `tiny` | `base` | `small`).
 pub fn engine_config(preset: &str) -> Result<EngineConfig> {
-    let mut cfg = EngineConfig::preset(preset, VOCAB_SIZE, OBS_LEN, ACTION_LEN)?;
+    let mut cfg = EngineConfig::preset(preset, vocab_size(), OBS_LEN, ACTION_LEN)?;
     cfg.ttt.conv_width = CONV_WIDTH;
     cfg.ttt.readout_last = READOUT_LAST;
+    cfg.ttt.readout_pools = READOUT_POOLS;
     cfg.jepa.probe_weight = PROBE_WEIGHT;
+    cfg.jepa.copy_dim = COPY_DIM;
+    cfg.jepa.horizon = HORIZON;
+    // Mandatory latent reasoning before every action: tree of hypotheses → MPPI → latent GD.
+    cfg.planner.tree_beam = TREE_BEAM;
+    cfg.planner.tree_branch = TREE_BRANCH;
+    cfg.planner.kind = PlannerKind::MppiThenGradient;
     Ok(cfg)
 }
 
@@ -144,9 +176,11 @@ pub struct PageSnapshot {
 }
 
 impl PageSnapshot {
-    /// Index of the first element with `role` whose text equals `text` (case-insensitive).
+    /// Index of the first element with `role` whose text equals `text` (case-insensitive,
+    /// surrounding whitespace ignored).
     pub fn find(&self, role: Role, text: &str) -> Option<usize> {
-        self.elements.iter().position(|e| e.role == role && e.text.eq_ignore_ascii_case(text))
+        let text = text.trim().to_lowercase();
+        self.elements.iter().position(|e| e.role == role && e.text.trim().to_lowercase() == text)
     }
 
     /// Index of the first element with `role`.
