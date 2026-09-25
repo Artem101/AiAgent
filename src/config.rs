@@ -72,6 +72,8 @@ pub struct JepaConfig {
     /// Key width of the probe's copy mechanism ([`crate::copy`]): thoughts can point at
     /// context tokens instead of spelling them out. `0` = off; needs the probe.
     pub copy_dim: usize,
+    /// Token ids below this are never copied (the special tokens of the vocabulary).
+    pub copy_min_token: u32,
 }
 
 /// Which trajectory optimiser runs at inference time.
@@ -207,6 +209,7 @@ impl EngineConfig {
                 policy_weight: 1.0,
                 probe_weight: 0.0,
                 copy_dim: 0,
+                copy_min_token: 0,
             },
             planner: PlannerConfig {
                 kind: PlannerKind::Mppi,

@@ -84,7 +84,11 @@ impl Jepa {
             } else {
                 None
             },
-            copy: if j.copy_dim > 0 { Some(CopyHead::new(online, cfg.flow.d_token, j.copy_dim)?) } else { None },
+            copy: if j.copy_dim > 0 {
+                Some(CopyHead::new(online, cfg.flow.d_token, j.copy_dim, j.copy_min_token)?)
+            } else {
+                None
+            },
         };
         Self::ema(online, target, 0.0)?; // Ē ← E
         Ok(jepa)

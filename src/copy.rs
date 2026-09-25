@@ -18,6 +18,13 @@
 //! distributions, not over sampled tokens), so decoding stays non-autoregressive, and training
 //! maximises the exact marginal likelihood `log P_l(y_l)`.
 //!
+//! Two details make the pointer learnable. Special tokens (padding, role and verb tokens: ids
+//! below `min_token`) are never copied — otherwise the gate learns to "copy" the padding that
+//! fills most of a prompt and nothing else. And the pointer gets its own loss,
+//! `−log Σ_{t : x_t = y_l} p_l(t)` on every slot whose target occurs in the context: in the
+//! mixture alone its gradient is scaled by `λ_l`, and a gate that starts out preferring the
+//! vocabulary would never let the pointer learn.
+//!
 //! [`CopyHead`] is the graph path (training), [`PackedCopyHead`] the zero-allocation kernel
 //! path (inference); `tests` checks that they agree.
 
@@ -28,6 +35,10 @@ use crate::nn::{Lin, ParamStore};
 
 /// Floor inside `log(pointer mass)`.
 const PTR_EPS: f64 = 1e-12;
+/// Floor inside the pointer's own loss (bounds its gradient while attention is still flat).
+const AUX_EPS: f64 = 1e-6;
+/// Weight of the pointer's own loss relative to the mixture likelihood.
+pub const POINTER_WEIGHT: f64 = 1.0;
 
 /// Query and gates of the copy mechanism (graph path).
 #[derive(Debug, Clone)]
@@ -36,6 +47,8 @@ pub struct CopyHead {
     pub query: Lin,
     /// `e_l → (shift, copy)` gate logits.
     pub gate: Lin,
+    /// Token ids below this are never copied (special tokens).
+    pub min_token: u32,
 }
 
 /// `log σ(x)`, numerically stable.
@@ -46,10 +59,11 @@ fn log_sigmoid(x: &Tensor) -> Result<Tensor> {
 }
 
 impl CopyHead {
-    pub fn new(ps: &mut ParamStore, d_token: usize, d_key: usize) -> Result<Self> {
+    pub fn new(ps: &mut ParamStore, d_token: usize, d_key: usize, min_token: u32) -> Result<Self> {
         Ok(Self {
             query: ps.linear("jepa.copy_query", d_token, d_key, false)?,
             gate: ps.linear("jepa.copy_gate", d_token, 2, true)?,
+            min_token,
         })
     }
 
@@ -64,7 +78,7 @@ impl CopyHead {
         let n = keys.dims()[1];
         let q = self.query.forward(emb)?;
         let scores = (q.matmul(&keys.transpose(1, 2)?.contiguous()?)? / (self.d_key() as f64).sqrt())?;
-        let fresh = candle_nn::ops::softmax_last_dim(&scores)?;
+        let fresh = candle_nn::ops::softmax(&scores, D::Minus1)?; // not `softmax_last_dim`: no backward
         let gates = self.gate.forward(emb)?; // [M, L, 2]
         let shift = candle_nn::ops::sigmoid(&gates.narrow(2, 0, 1)?)?; // [M, L, 1]
         let mut p = Vec::with_capacity(l);
@@ -80,39 +94,46 @@ impl CopyHead {
         Ok((Tensor::stack(&p, 1)?, gates.narrow(2, 1, 1)?.squeeze(2)?))
     }
 
-    /// `log P_l(y_l)` of the mixture, `[M, L]`.
+    /// `log P_l(y_l)` of the mixture, `[M, L]`, and the pointer's own loss (a scalar).
     ///
     /// `emb: [M, L, d_token]`, `logits: [M, L, V]` (vocabulary head, f32),
     /// `keys: [M, N, d_key]`, `targets: [M, L]` (u32), `context: [M, N]` (u32 token ids).
-    pub fn log_likelihood(
+    pub fn losses(
         &self,
         emb: &Tensor,
         logits: &Tensor,
         keys: &Tensor,
         targets: &Tensor,
         context: &Tensor,
-    ) -> Result<Tensor> {
+    ) -> Result<(Tensor, Tensor)> {
         let (m, l, _) = emb.dims3()?;
         let n = context.dims()[1];
         let (p, copy_logit) = self.pointer(emb, keys)?;
         let (p, copy_logit) = (p.to_dtype(DType::F32)?, copy_logit.to_dtype(DType::F32)?);
-        // pointer mass on positions holding the target token
+        // pointer mass on (copyable) positions holding the target token
+        let copyable = context.ge(self.min_token)?.to_dtype(DType::F32)?.unsqueeze(1)?; // [M, 1, N]
         let hits = context
             .unsqueeze(1)?
             .broadcast_as((m, l, n))?
             .eq(&targets.unsqueeze(2)?.broadcast_as((m, l, n))?)?
-            .to_dtype(DType::F32)?;
-        let ptr = (p * hits)?.sum(D::Minus1)?; // [M, L]
+            .to_dtype(DType::F32)?
+            .broadcast_mul(&copyable)?;
+        let ptr = (p * &hits)?.sum(D::Minus1)?; // [M, L]
         let vocab =
             candle_nn::ops::log_softmax(logits, D::Minus1)?.gather(&targets.unsqueeze(2)?, D::Minus1)?.squeeze(2)?;
-        let a = (log_sigmoid(&copy_logit)? + (ptr + PTR_EPS)?.log()?)?;
+        let a = (log_sigmoid(&copy_logit)? + (&ptr + PTR_EPS)?.log()?)?;
         let b = (log_sigmoid(&copy_logit.neg()?)? + vocab)?;
         let mx = a.maximum(&b)?.detach();
-        ((a - &mx)?.exp()? + (b - &mx)?.exp()?)?.log()? + mx
+        let loglik = (((a - &mx)?.exp()? + (b - &mx)?.exp()?)?.log()? + mx)?;
+        // the pointer's own loss on the slots it could have copied
+        let copyable_slot = hits.max(D::Minus1)?; // [M, L], 1 where the target occurs
+        let count = copyable_slot.sum_all()?.to_scalar::<f32>()?.max(1.0) as f64;
+        let aux = ((((ptr + AUX_EPS)?.log()?.neg()? * copyable_slot)?.sum_all()?) / count)?;
+        Ok((loglik, aux))
     }
 
     pub fn pack(&self, dtype: DType) -> Result<PackedCopyHead> {
-        Ok(PackedCopyHead { query: self.query.pack(dtype)?, gate: self.gate.pack(dtype)? })
+        Ok(PackedCopyHead { query: self.query.pack(dtype)?, gate: self.gate.pack(dtype)?, min_token: self.min_token })
     }
 }
 
@@ -121,6 +142,8 @@ impl CopyHead {
 pub struct PackedCopyHead {
     pub query: PackedLinear,
     pub gate: PackedLinear,
+    /// Token ids below this are never copied.
+    pub min_token: u32,
 }
 
 /// Scratch of [`PackedCopyHead::mix`] (pre-allocated; `capacity` = longest context).
@@ -173,8 +196,10 @@ impl PackedCopyHead {
             softmax(row);
             row.iter_mut().for_each(|x| *x *= 1.0 - lambda);
             for (&tok, &p) in tokens.iter().zip(fresh.iter()) {
-                if let Some(x) = row.get_mut(tok as usize) {
-                    *x += lambda * p;
+                if tok >= self.min_token {
+                    if let Some(x) = row.get_mut(tok as usize) {
+                        *x += lambda * p;
+                    }
                 }
             }
         }
@@ -202,9 +227,9 @@ mod tests {
     #[test]
     fn packed_mixture_matches_graph_likelihood() -> Result<()> {
         let dev = Device::Cpu;
-        let (l, dt, dk, n, v) = (5, 6, 4, 7, 11);
+        let (l, dt, dk, n, v) = (5, 6, 4, 8, 11);
         let mut ps = ParamStore::new(&dev, 5);
-        let head = CopyHead::new(&mut ps, dt, dk)?;
+        let head = CopyHead::new(&mut ps, dt, dk, 2)?; // tokens 0 and 1 are "special"
         let mut rng = Rng::new(3);
         let mut rand = |len: usize| {
             let mut x = vec![0f32; len];
@@ -212,7 +237,7 @@ mod tests {
             x
         };
         let (emb, logits, keys) = (rand(l * dt), rand(l * v), rand(n * dk));
-        let context: Vec<u32> = vec![3, 1, 4, 1, 5, 9, 2];
+        let context: Vec<u32> = vec![3, 1, 4, 1, 5, 9, 2, 0];
         // packed: full distributions per slot
         let packed = head.pack(DType::F32)?;
         let mut scratch = CopyScratch::new(&mut Arena::new(&dev), dk, 16);
@@ -229,7 +254,7 @@ mod tests {
         let ctx = Tensor::from_slice(&context, (1, n), &dev)?;
         for tok in 0..v as u32 {
             let targets = Tensor::from_slice(&vec![tok; l], (1, l), &dev)?;
-            let ll = head.log_likelihood(&e, &lg, &k, &targets, &ctx)?.squeeze(0)?.to_vec1::<f32>()?;
+            let ll = head.losses(&e, &lg, &k, &targets, &ctx)?.0.squeeze(0)?.to_vec1::<f32>()?;
             for (slot, want) in ll.iter().enumerate() {
                 let got = rows[slot * v + tok as usize].ln();
                 assert!((got - want).abs() < 1e-4, "slot {slot} token {tok}: packed {got} vs graph {want}");

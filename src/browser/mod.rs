@@ -89,6 +89,7 @@ pub fn engine_config(preset: &str) -> Result<EngineConfig> {
     cfg.ttt.readout_pools = READOUT_POOLS;
     cfg.jepa.probe_weight = PROBE_WEIGHT;
     cfg.jepa.copy_dim = COPY_DIM;
+    cfg.jepa.copy_min_token = crate::text::SPECIALS.len() as u32;
     cfg.jepa.horizon = HORIZON;
     // Mandatory latent reasoning before every action: tree of hypotheses → MPPI → latent GD.
     cfg.planner.tree_beam = TREE_BEAM;

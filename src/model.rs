@@ -13,7 +13,7 @@
 //! probe is optional (`JepaConfig::probe_weight > 0`); `S` holds `s_0`, `s_H` and random
 //! intermediate thoughts (all of them by default, see `TrainConfig::probe_states`); `P` is the softmax of the shared head,
 //! or its mixture with pointers into the prompt when the copy mechanism is on
-//! (`JepaConfig::copy_dim > 0`, see [`crate::copy`]).
+//! (`JepaConfig::copy_dim > 0`, see [`crate::copy`]; the pointer's own loss is then added).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -59,8 +59,10 @@ pub struct LossReport {
     pub cov: f32,
     pub goal: f32,
     pub policy: f32,
-    /// Thought-probe cross-entropy (0 when the probe is disabled).
+    /// Thought-probe cross-entropy (0 when the probe is disabled), including the pointer loss.
     pub probe: f32,
+    /// The copy pointer's own loss (0 without a copy mechanism).
+    pub pointer: f32,
 }
 
 impl LossReport {
@@ -76,6 +78,7 @@ impl LossReport {
         self.goal += o.goal;
         self.policy += o.policy;
         self.probe += o.probe;
+        self.pointer += o.pointer;
     }
     /// Multiplies every term by `s`.
     pub fn scaled(&self, s: f32) -> Self {
@@ -90,6 +93,7 @@ impl LossReport {
             goal: self.goal * s,
             policy: self.policy * s,
             probe: self.probe * s,
+            pointer: self.pointer * s,
         }
     }
 }
@@ -103,6 +107,9 @@ impl std::fmt::Display for LossReport {
         )?;
         if self.probe != 0.0 {
             write!(f, " probe {:.4}", self.probe)?;
+        }
+        if self.pointer != 0.0 {
+            write!(f, " ptr {:.4}", self.pointer)?;
         }
         Ok(())
     }
@@ -175,6 +182,7 @@ impl CogModel {
         let (mut plan, terms) = self.jepa.forward_train(&readouts, &self.cfg.jepa)?;
         let targets = batch.answer.flatten_all()?;
         let mut probe_ce = None;
+        let mut copy_aux = None;
         if let Some(probe) = &self.jepa.probe {
             // every thought s_0 … s_H must decode into the answer through the shared head —
             // and so must the goal ĝ the latent search steers towards (`probe_goal`)
@@ -213,8 +221,9 @@ impl CogModel {
             let tgt = per_state(&batch.answer)?;
             probe_ce = Some(match (&self.jepa.copy, &keys) {
                 (Some(copy), Some(keys)) => {
-                    let ll = copy.log_likelihood(&emb, &logits, &per_state(keys)?, &tgt, &per_state(&batch.prompt)?)?;
-                    ll.mean_all()?.neg()?
+                    let (ll, aux) = copy.losses(&emb, &logits, &per_state(keys)?, &tgt, &per_state(&batch.prompt)?)?;
+                    copy_aux = Some(aux.clone());
+                    (ll.mean_all()?.neg()? + (aux * crate::copy::POINTER_WEIGHT)?)?
                 }
                 _ => candle_nn::loss::cross_entropy(&logits.reshape((b * n * l, vocab))?, &tgt.flatten_all()?)?,
             });
@@ -260,6 +269,7 @@ impl CogModel {
             goal: s(&terms.goal)?,
             policy: s(&terms.policy)?,
             probe: probe_ce.as_ref().map(s).transpose()?.unwrap_or(0.0),
+            pointer: copy_aux.as_ref().map(s).transpose()?.unwrap_or(0.0),
         };
         Ok((total, report))
     }

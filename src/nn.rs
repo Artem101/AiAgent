@@ -209,7 +209,9 @@ pub fn mha(q: &Tensor, k: &Tensor, v: &Tensor, heads: usize) -> Result<Tensor> {
     let (q, k, v) = (split(q, lq)?, split(k, lk)?, split(v, lk)?);
     let scores = (q.matmul(&k.t()?.contiguous()?)? * (1.0 / (dh as f64).sqrt()))?;
     let dt = scores.dtype();
-    let p = candle_nn::ops::softmax_last_dim(&scores.to_dtype(DType::F32)?)?.to_dtype(dt)?;
+    // `softmax_last_dim` is a fused kernel without a backward pass: it would silently cut the
+    // gradient to the queries and keys.
+    let p = candle_nn::ops::softmax(&scores.to_dtype(DType::F32)?, candle_core::D::Minus1)?.to_dtype(dt)?;
     p.matmul(&v)?.transpose(1, 2)?.reshape((b, lq, d))
 }
 

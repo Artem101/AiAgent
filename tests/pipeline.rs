@@ -69,3 +69,44 @@ fn train_save_load_generate() -> Result<()> {
     assert_eq!(a.memory().context_state_bytes, mem.context_state_bytes);
     Ok(())
 }
+
+/// Every trainable parameter of the full browsing model (TTT with window, pools and copy keys,
+/// JEPA with probe and copy head, the DiT decoder) receives a gradient once adaLN-Zero has
+/// opened up. Catches ops without a backward pass (e.g. `candle_nn::ops::softmax_last_dim`),
+/// which silently freeze everything before them.
+#[test]
+fn every_parameter_receives_a_gradient() -> Result<()> {
+    let dev = Device::Cpu;
+    let mut cfg = cog_engine::browser::engine_config("tiny")?;
+    cfg.planner.num_samples = 8;
+    let mut tc = TrainConfig::quick(Task::Browser);
+    tc.batch_size = 8;
+    tc.warmup = 1;
+    tc.eval_every = 0;
+    tc.probe_states = 3;
+    let mut trainer = Trainer::new(CogModel::new(cfg, &dev)?, tc.clone())?;
+    for _ in 0..4 {
+        trainer.train_step()?;
+    }
+    let model = &trainer.model;
+    let mut rng = cog_engine::kernels::rng::Rng::new(3);
+    let batch = trainer.sampler.batch(&mut rng, 8, &dev)?;
+    let grads = model.loss(&batch, &mut rng, &tc)?.0.backward()?;
+    let mut frozen = Vec::new();
+    for name in model.online.names() {
+        // a key bias shifts every score of a query equally: softmax ignores it
+        if name.ends_with(".k.bias") {
+            continue;
+        }
+        let v = model.online.var(&name).expect("listed");
+        let norm = match grads.get(v.as_tensor()) {
+            Some(g) => g.sqr()?.sum_all()?.to_scalar::<f32>()?,
+            None => 0.0,
+        };
+        if norm == 0.0 {
+            frozen.push(name);
+        }
+    }
+    assert!(frozen.is_empty(), "parameters without a gradient: {frozen:?}");
+    Ok(())
+}

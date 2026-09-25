@@ -5,7 +5,7 @@
 ```bash
 cargo fmt --check                    # rustfmt.toml: max_width = 120
 cargo clippy --all-targets           # должно быть 0 предупреждений
-cargo test                           # 50 тестов, ~15 с без учёта компиляции
+cargo test                           # 51 тест, ~15 с без учёта компиляции
 cargo build --release --examples     # примеры компилируются
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps   # нет битых ссылок в rustdoc
 ```
@@ -36,6 +36,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps   # нет битых ссыло�
 | `jepa::ema_moves_target_towards_online` | `θ̄ = τθ̄ + (1−τ)θ` |
 | `tests/zero_alloc.rs` | 0 аллокаций в горячих циклах, последовательно и под rayon |
 | `tests/pipeline.rs` | обучение снижает loss; чекпойнт восстанавливает бит-в-бит одинаковый движок; генерация детерминирована; память контекста постоянна |
+| `tests/pipeline.rs::every_parameter_receives_a_gradient` | каждый обучаемый параметр полной браузерной модели получает ненулевой градиент (кроме смещений ключей, которые softmax не видит). Ловит операции без backward: так нашлось, что `softmax_last_dim` из candle-nn обрывал градиент к Q/K внимания декодера |
 | `ttt::packed_encoder_matches_graph` (вариант с окном) | паритет и при `conv_width = 3`, `readout_last = 2`, `readout_pools = 3`; ключи памяти копирования упакованного энкодера = graph, память ограничена |
 | `copy::packed_mixture_matches_graph_likelihood` | упакованная смесь словаря и указателей (`PackedCopyHead::mix`) = graph `log P` для каждого токена в каждом слоте |
 | `tools::calc::*` | точная арифметика: приоритеты, унарный минус, десятичные, округление, деление на ноль, запрет `**`/`//`/вызовов, пределы |
