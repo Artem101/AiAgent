@@ -1,0 +1,31 @@
+[package]
+name = "cog_engine"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.87"
+description = "Hybrid non-autoregressive cognitive engine: TTT encoder + JEPA latent planner + continuous flow-matching decoder"
+license = "MIT OR Apache-2.0"
+
+[features]
+default = []
+# Device-generic training / graph path on CUDA (candle backend). The zero-allocation
+# host kernels are CPU-only; on CUDA the in-place helpers fall back to graph ops.
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+
+[dependencies]
+candle-core = "0.11"
+candle-nn = "0.11"
+half = "2"
+rayon = "1.12.0"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "fs"] }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+
+# Tests train tiny models; keep dependencies (candle/gemm) optimised in debug builds.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.dev]
+opt-level = 1
