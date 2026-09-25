@@ -24,6 +24,7 @@ impl Task {
         }
     }
 
+    /// Name used on the command line.
     pub fn name(&self) -> &'static str {
         match self {
             Self::Sort => "sort",
@@ -32,6 +33,7 @@ impl Task {
         }
     }
 
+    /// The correct answer for `prompt`.
     pub fn apply(&self, prompt: &[u32]) -> Vec<u32> {
         let mut out = prompt.to_vec();
         match self {
@@ -53,6 +55,7 @@ pub struct Batch {
     pub answers: Vec<Vec<u32>>,
 }
 
+/// Draws random prompts and their answers for a [`Task`].
 #[derive(Debug, Clone)]
 pub struct TaskSampler {
     pub task: Task,
@@ -69,12 +72,14 @@ impl TaskSampler {
         Ok(Self { task, vocab, prompt_len, answer_len })
     }
 
+    /// One `(prompt, answer)` pair.
     pub fn example(&self, rng: &mut Rng) -> (Vec<u32>, Vec<u32>) {
         let prompt: Vec<u32> = (0..self.prompt_len).map(|_| rng.below(self.vocab) as u32).collect();
         let answer = self.task.apply(&prompt);
         (prompt, answer)
     }
 
+    /// A batch of `size` examples as tensors on `device`.
     pub fn batch(&self, rng: &mut Rng, size: usize, device: &Device) -> Result<Batch> {
         let (prompts, answers): (Vec<_>, Vec<_>) = (0..size).map(|_| self.example(rng)).unzip();
         Ok(Batch {

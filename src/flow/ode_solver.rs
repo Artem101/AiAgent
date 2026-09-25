@@ -33,6 +33,7 @@ impl SolverKind {
             other => candle_core::bail!("unknown solver '{other}' (euler | midpoint | heun)"),
         }
     }
+    /// Vector-field evaluations per step (NFE per step).
     pub fn evals_per_step(&self) -> usize {
         match self {
             Self::Euler => 1,
@@ -41,6 +42,7 @@ impl SolverKind {
     }
 }
 
+/// Integration settings of the flow sampler.
 #[derive(Debug, Clone)]
 pub struct ODESolverConfig {
     pub steps: usize,
@@ -101,6 +103,7 @@ impl SamplerBuffers {
     }
 }
 
+/// Integrates `dX = v(X, t | plan) dt` from `t = 0` to `t = 1` with a borrowed estimator.
 pub struct FlowMatchingSampler<'a> {
     pub estimator: &'a mut dyn VectorFieldEstimator,
     pub config: ODESolverConfig,

@@ -5,6 +5,7 @@ use candle_core::{DType, Result, Tensor, D};
 use crate::kernels::PackedMlp;
 use crate::nn::{Mlp, ParamStore};
 
+/// Graph-path world model (trainable, differentiable).
 #[derive(Debug, Clone)]
 pub struct WorldModel {
     pub mlp: Mlp,
@@ -35,6 +36,7 @@ impl WorldModel {
         Tensor::stack(&states, 1)
     }
 
+    /// Packs the weights for the host kernels.
     pub fn pack(&self, dtype: DType) -> Result<PackedWorldModel> {
         Ok(PackedWorldModel { mlp: self.mlp.pack(dtype)?, d_state: self.d_state, d_action: self.d_action })
     }
@@ -53,6 +55,7 @@ pub struct PackedWorldModel {
 }
 
 impl PackedWorldModel {
+    /// Hidden width of the transition MLP.
     pub fn d_hidden(&self) -> usize {
         self.mlp.l1.d_out
     }

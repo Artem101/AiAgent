@@ -24,6 +24,7 @@ pub struct EngineScore {
     pub mean_latency_us: f32,
 }
 
+/// Result of [`Trainer::evaluate`].
 #[derive(Debug, Clone, Default)]
 pub struct EvalReport {
     pub samples: usize,
@@ -73,6 +74,7 @@ fn score(preds: &[Vec<u32>], targets: &[Vec<u32>]) -> (f32, f32) {
     (tok as f32 / n.max(1) as f32, exact as f32 / preds.len().max(1) as f32)
 }
 
+/// Owns a [`CogModel`], its AdamW optimiser, the data sampler and the training RNG.
 pub struct Trainer {
     pub model: CogModel,
     pub tc: TrainConfig,
@@ -84,6 +86,7 @@ pub struct Trainer {
 }
 
 impl Trainer {
+    /// Creates the optimiser over the model's trainable parameters.
     pub fn new(model: CogModel, tc: TrainConfig) -> Result<Self> {
         let cfg = &model.cfg;
         let sampler = TaskSampler::new(tc.task, cfg.vocab_size, cfg.max_prompt_len, cfg.answer_len())?;
@@ -94,6 +97,7 @@ impl Trainer {
         Ok(Self { model, tc, sampler, vars, opt, rng, step: 0 })
     }
 
+    /// Number of optimisation steps taken so far.
     pub fn step(&self) -> usize {
         self.step
     }

@@ -48,6 +48,7 @@ impl UnembedHead {
     }
 }
 
+/// Host-kernel unembedding head.
 #[derive(Debug, Clone)]
 pub struct PackedHead {
     pub lin: PackedLinear,
@@ -62,6 +63,7 @@ impl PackedHead {
             *tok = argmax(row) as u32;
         }
     }
+    /// Vocabulary size (number of logits per position).
     pub fn vocab(&self) -> usize {
         self.lin.d_out
     }

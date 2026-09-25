@@ -9,6 +9,7 @@
 
 use candle_core::{DType, Device, Result, Shape, Tensor};
 
+/// Hands out pre-allocated buffers and keeps count of them (see the module docs).
 #[derive(Debug)]
 pub struct Arena {
     device: Device,
@@ -21,6 +22,7 @@ impl Arena {
         Self { device: device.clone(), bytes: 0, buffers: 0 }
     }
 
+    /// Device on which [`Arena::tensor`] allocates.
     pub fn device(&self) -> &Device {
         &self.device
     }
@@ -52,6 +54,7 @@ impl Arena {
         self.bytes
     }
 
+    /// Number of buffers handed out so far.
     pub fn buffers(&self) -> usize {
         self.buffers
     }

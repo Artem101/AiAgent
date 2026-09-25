@@ -19,6 +19,7 @@ use crate::model::CogModel;
 use crate::ttt::{PackedTttEncoder, TttWorkspace};
 use crate::types::{LatentPlan, LatentState, PromptState};
 
+/// Wall-clock time of the three stages of one generation.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StageTimings {
     pub encode: Duration,
@@ -27,6 +28,7 @@ pub struct StageTimings {
 }
 
 impl StageTimings {
+    /// Sum of the three stages.
     pub fn total(&self) -> Duration {
         self.encode + self.plan + self.decode
     }
@@ -41,6 +43,7 @@ pub struct Generation {
     pub refined: bool,
 }
 
+/// Memory held by an engine (see [`CognitiveEngine::memory`]).
 #[derive(Debug, Clone, Copy)]
 pub struct MemoryReport {
     /// Packed weights (bf16 by default).
@@ -52,6 +55,11 @@ pub struct MemoryReport {
     pub context_state_bytes: usize,
 }
 
+/// Inference engine: packed weights plus every pre-allocated buffer for one request.
+///
+/// Build it once with [`CognitiveEngine::from_model`]; afterwards
+/// [`CognitiveEngine::generate_into`] runs without heap allocation. Methods take `&mut self`
+/// because the buffers are reused — use one engine per thread or a `Mutex`.
 pub struct CognitiveEngine {
     cfg: EngineConfig,
     ttt: PackedTttEncoder,
@@ -136,14 +144,17 @@ impl CognitiveEngine {
         Ok(engine)
     }
 
+    /// Configuration the engine was packed with (including runtime overrides).
     pub fn config(&self) -> &EngineConfig {
         &self.cfg
     }
 
+    /// Bytes held in packed weights, in the arena, and in `W_fast`.
     pub fn memory(&self) -> MemoryReport {
         self.memory
     }
 
+    /// Selects MPPI alone or MPPI followed by latent gradient descent.
     pub fn set_planner(&mut self, kind: PlannerKind) {
         self.cfg.planner.kind = kind;
     }
@@ -160,6 +171,7 @@ impl CognitiveEngine {
         self.planner.config.policy_prior = on;
     }
 
+    /// Changes the ODE solver and its number of steps (no retraining needed).
     pub fn set_solver(&mut self, solver: SolverKind, steps: usize) {
         self.solver.solver = solver;
         self.solver.steps = steps.max(1);
@@ -247,6 +259,7 @@ impl CognitiveEngine {
         self.bufs.x.copy()
     }
 
+    /// Storage precision of the packed weights.
     pub fn weight_dtype(&self) -> DType {
         self.cfg.weight_dtype
     }

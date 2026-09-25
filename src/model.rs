@@ -23,7 +23,11 @@ use crate::kernels::rng::Rng;
 use crate::nn::{self, Init, ParamStore};
 use crate::ttt::{TttEncoder, SEGMENT_ANSWER, SEGMENT_PROMPT};
 
+/// The complete trainable system (graph path): TTT encoder, JEPA, CFM vector field and
+/// unembedding head, with their parameter stores. Pack it into a [`crate::CognitiveEngine`]
+/// for inference.
 pub struct CogModel {
+    /// Architecture this model was built with (needed to load checkpoints).
     pub cfg: EngineConfig,
     /// Trainable parameters (optimised by AdamW).
     pub online: ParamStore,
@@ -53,6 +57,7 @@ pub struct LossReport {
 }
 
 impl LossReport {
+    /// Adds another report term by term (for running averages).
     pub fn accumulate(&mut self, o: &Self) {
         self.total += o.total;
         self.cfm += o.cfm;
@@ -64,6 +69,7 @@ impl LossReport {
         self.goal += o.goal;
         self.policy += o.policy;
     }
+    /// Multiplies every term by `s`.
     pub fn scaled(&self, s: f32) -> Self {
         Self {
             total: self.total * s,
@@ -96,6 +102,7 @@ fn randn(rng: &mut Rng, shape: &[usize], std: f32, device: &Device) -> Result<Te
 }
 
 impl CogModel {
+    /// Builds a deterministically initialised model on `device` (validates `cfg` first).
     pub fn new(cfg: EngineConfig, device: &Device) -> Result<Self> {
         cfg.validate()?;
         let mut online = ParamStore::new(device, cfg.seed);
@@ -108,14 +115,17 @@ impl CogModel {
         Ok(Self { cfg, online, target, ttt, jepa, flow, head, out_emb, device: device.clone() })
     }
 
+    /// Device of the graph-path parameters.
     pub fn device(&self) -> &Device {
         &self.device
     }
 
+    /// Parameters the optimiser updates (excludes the EMA target encoder and frozen buffers).
     pub fn trainable_vars(&self) -> Vec<Var> {
         self.online.vars()
     }
 
+    /// Number of trainable scalars.
     pub fn num_params(&self) -> usize {
         self.online.num_params()
     }
@@ -205,6 +215,8 @@ impl CogModel {
         self.head.forward(&x1)?.argmax(candle_core::D::Minus1)?.to_dtype(DType::U32)?.to_vec2::<u32>()
     }
 
+    /// Writes all parameters (`online.*`) and non-trainable state (`target.*`) to one
+    /// safetensors file.
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let mut map = HashMap::new();
         self.online.export("online", &mut map);
@@ -212,6 +224,7 @@ impl CogModel {
         candle_core::safetensors::save(&map, path)
     }
 
+    /// Loads a checkpoint written by [`CogModel::save`] into a model of the same architecture.
     pub fn load<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let map = candle_core::safetensors::load(path, &self.device)?;
         self.online.import("online", &map)?;

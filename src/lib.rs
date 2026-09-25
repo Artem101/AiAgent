@@ -26,6 +26,10 @@
 //!   ([`flow::FlowMatchingSampler::integrate`], [`ttt::FastWeightsState::step_update`],
 //!   [`jepa::JEPAPlanner::plan_into`]) perform **zero heap allocations** (enforced by
 //!   `tests/zero_alloc.rs`).
+//!
+//! Guides (in Russian) live in the repository under `cog_engine/docs/`: architecture, math,
+//! training, library API, CLI, configuration, runtime internals and development. Runnable
+//! examples: `examples/quickstart.rs` and `examples/staged.rs`.
 
 pub mod arena;
 pub mod config;

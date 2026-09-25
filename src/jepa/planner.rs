@@ -34,6 +34,7 @@ use crate::kernels::inplace::{copy_from_slice, host_read};
 use crate::kernels::{parallel_for, rng::Rng, tanh_inplace, PackedMlp};
 use crate::types::{LatentPlan, LatentState};
 
+/// Diagnostics of one planning call.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PlanStats {
     /// Energy of the returned trajectory.
@@ -76,11 +77,17 @@ impl MppiWorkspace {
     }
 }
 
+/// MPPI trajectory optimiser over a packed world model (see the module docs).
 pub struct JEPAPlanner {
+    /// Transition model used for every rollout.
     pub world_model: PackedWorldModel,
+    /// Number of actions `H` per trajectory.
     pub horizon: usize,
+    /// Sampled trajectories `M` per iteration.
     pub num_samples: usize,
+    /// Softmax temperature λ of the path-integral weights.
     pub temperature: f64,
+    /// Remaining planner settings (noise, iterations, action cost, …).
     pub config: PlannerConfig,
     /// Seed used by the allocating [`JEPAPlanner::plan`] convenience method.
     pub seed: u64,
@@ -107,6 +114,7 @@ impl JEPAPlanner {
         self
     }
 
+    /// Allocates every buffer [`JEPAPlanner::plan_into`] needs.
     pub fn workspace(&self, arena: &mut Arena) -> Result<MppiWorkspace> {
         let (m, h) = (self.num_samples, self.horizon);
         let (ds, da, dh) = (self.world_model.d_state, self.world_model.d_action, self.world_model.d_hidden());
@@ -297,6 +305,7 @@ pub struct GradientPlanner {
     pub action_cost: f64,
 }
 
+/// Output of [`GradientPlanner::refine`].
 pub struct GradientPlan {
     /// `[H, d_a]`.
     pub actions: Tensor,
