@@ -105,10 +105,13 @@ fn check_hot_loops(model: &CogModel, label: &str) -> Result<()> {
 #[test]
 fn hot_loops_do_not_allocate() -> Result<()> {
     let model = CogModel::new(EngineConfig::tiny(10, 8, 8), &Device::Cpu)?;
+    // The browsing configuration: TTT causal window, last-output readout, answer probe.
+    let browser = CogModel::new(cog_engine::browser::engine_config("tiny")?, &Device::Cpu)?;
 
     // Sequential kernels.
     kernels::set_parallel(false);
     check_hot_loops(&model, "sequential")?;
+    check_hot_loops(&browser, "sequential, browser config")?;
 
     // rayon fan-out inside a pool: nested parallel iterators use worker-local deques only.
     kernels::set_parallel(true);
@@ -116,6 +119,7 @@ fn hot_loops_do_not_allocate() -> Result<()> {
     // Make sure every worker thread has started (thread start-up allocates) before measuring.
     pool.broadcast(|_| ());
     pool.install(|| check_hot_loops(&model, "rayon"))?;
+    pool.install(|| check_hot_loops(&browser, "rayon, browser config"))?;
 
     // Sanity: the counter does observe allocations.
     let (_, n) = count(|| Tensor::zeros(16, candle_core::DType::F32, &Device::Cpu));

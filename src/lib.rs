@@ -27,11 +27,16 @@
 //!   [`jepa::JEPAPlanner::plan_into`]) perform **zero heap allocations** (enforced by
 //!   `tests/zero_alloc.rs`).
 //!
+//! On top of the engine, [`browser`] turns it into a web-browsing agent: it observes pages of
+//! a real headless Chromium (over the DevTools protocol), decides on clicks, typing and
+//! navigation, and answers questions by searching the web (`cog_engine agent`).
+//!
 //! Guides (in Russian) live in the repository's `docs/` directory: architecture, math,
 //! training, library API, CLI, configuration, runtime internals and development. Runnable
 //! examples: `examples/quickstart.rs` and `examples/staged.rs`.
 
 pub mod arena;
+pub mod browser;
 pub mod config;
 pub mod data;
 pub mod flow;

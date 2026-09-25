@@ -17,6 +17,7 @@
 | подобрать размеры модели и параметры планировщика | [configuration.md](configuration.md) |
 | узнать, как устроены ядра: память, точность, SIMD, параллелизм, скорость | [runtime.md](runtime.md) |
 | менять код, не сломав гарантии; добавить задачу, решатель или ядро | [development.md](development.md) |
+| сделать из движка агента, который ищет информацию в браузере (Chromium) | [browser.md](browser.md) |
 
 ## Быстрый старт
 
@@ -25,7 +26,7 @@ git clone https://github.com/Artem101/AiAgent.git && cd AiAgent
 cargo run --release -- demo                    # обучить ~4 мин на CPU, оценить, замерить скорость
 cargo run --release --example quickstart       # то же самое из кода библиотеки
 cargo run --release --example staged           # экскурсия по API по стадиям
-cargo test                                     # 26 тестов, включая проверку «0 аллокаций»
+cargo test                                     # 41 тест, включая «0 аллокаций» и паритет симулятора с Chromium
 ```
 
 ## Словарь

@@ -9,6 +9,12 @@
 //!                  [--solver heun|midpoint|euler] [--ode-steps 16] [--seed 0]
 //! cog_engine bench [--ckpt model.safetensors] [--iters 200]
 //! cog_engine serve --ckpt model.safetensors [--addr 127.0.0.1:7878]   (tokio, one prompt per line)
+//!
+//! browsing agent (train with `--task browser`):
+//! cog_engine agent --ckpt agent.safetensors --question "сколько стоит лампа" [--world 42]
+//!                  [--browser chrome|sim] [--policy model|expert] [--max-steps 10] [--headed]
+//! cog_engine agent-eval --ckpt agent.safetensors [--episodes 100] [--browser sim|chrome] [--policy model|expert]
+//! cog_engine site  [--addr 127.0.0.1:8080]                  serve the sandbox web for a human browser
 //! ```
 
 use std::collections::HashMap;
@@ -17,6 +23,11 @@ use std::time::Instant;
 
 use candle_core::{bail, DType, Device, Result};
 
+use cog_engine::browser::agent::{self as browsing, EnginePolicy, ExpertPolicy, Policy};
+use cog_engine::browser::chrome::{Chrome, ChromeOptions};
+use cog_engine::browser::sim::SIM_ORIGIN;
+use cog_engine::browser::vocab::{self, token_str};
+use cog_engine::browser::{Browser, Goal, SimBrowser, SiteServer};
 use cog_engine::config::PlannerKind;
 use cog_engine::data::Task;
 use cog_engine::flow::SolverKind;
@@ -31,13 +42,14 @@ struct Args {
 
 impl Args {
     fn parse() -> Result<Self> {
-        let mut it = std::env::args().skip(1);
+        let mut it = std::env::args().skip(1).peekable();
         let mut cmd = "demo".to_string();
         let mut opts = HashMap::new();
         let mut first = true;
         while let Some(a) = it.next() {
             if let Some(k) = a.strip_prefix("--") {
-                let v = it.next().unwrap_or_default();
+                // `--flag` without a value (e.g. `--headed`) when followed by another option.
+                let v = it.next_if(|n| !n.starts_with("--")).unwrap_or_default();
                 opts.insert(k.to_string(), v);
             } else if first {
                 cmd = a;
@@ -68,33 +80,59 @@ struct Meta {
     len: usize,
     task: Task,
     seed: u64,
+    /// TTT causal window width (`ttt.conv_width`).
+    conv: usize,
+    /// Final TTT outputs in the readout (`ttt.readout_last`).
+    readout_last: usize,
+    /// Answer-probe loss weight (`jepa.probe_weight`; > 0 adds the probe head).
+    probe: f64,
 }
 
 impl Meta {
     fn from_args(a: &Args) -> Result<Self> {
+        let task = Task::parse(&a.get("task", "sort"))?;
+        // The browsing task needs the causal window and the query readout (see docs/browser.md).
+        let (conv, last, probe) = match task {
+            Task::Browser => {
+                (cog_engine::browser::CONV_WIDTH, cog_engine::browser::READOUT_LAST, cog_engine::browser::PROBE_WEIGHT)
+            }
+            _ => (1, 0, 0.0),
+        };
+        // Fixed-size tasks record their real dimensions (`Task::dims` ignores the flags).
+        let (vocab, len, _) = task.dims(a.num("vocab", 10)?, a.num("len", 8)?);
         Ok(Self {
             preset: a.get("preset", "tiny"),
-            vocab: a.num("vocab", 10)?,
-            len: a.num("len", 8)?,
-            task: Task::parse(&a.get("task", "sort"))?,
+            vocab,
+            len,
+            task,
             seed: a.num("seed", 7)?,
+            conv: a.num("conv", conv)?,
+            readout_last: a.num("readout-last", last)?,
+            probe: a.num("probe", probe)?,
         })
     }
 
     fn config(&self) -> Result<EngineConfig> {
-        let mut cfg = EngineConfig::preset(&self.preset, self.vocab, self.len, self.len)?;
+        let (vocab, n, l) = self.task.dims(self.vocab, self.len);
+        let mut cfg = EngineConfig::preset(&self.preset, vocab, n, l)?;
         cfg.seed = self.seed;
+        cfg.ttt.conv_width = self.conv;
+        cfg.ttt.readout_last = self.readout_last;
+        cfg.jepa.probe_weight = self.probe;
         Ok(cfg)
     }
 
     fn save(&self, ckpt: &str) -> Result<()> {
         let s = format!(
-            "preset={}\nvocab={}\nlen={}\ntask={}\nseed={}\n",
+            "preset={}\nvocab={}\nlen={}\ntask={}\nseed={}\nconv={}\nreadout_last={}\nprobe={}\n",
             self.preset,
             self.vocab,
             self.len,
             self.task.name(),
-            self.seed
+            self.seed,
+            self.conv,
+            self.readout_last,
+            self.probe
         );
         std::fs::write(format!("{ckpt}.cfg"), s).map_err(candle_core::Error::wrap)
     }
@@ -111,6 +149,13 @@ impl Meta {
             len: num("len")? as usize,
             task: Task::parse(get("task")?)?,
             seed: num("seed")?,
+            // absent in checkpoints written before these options existed
+            conv: if kv.contains_key("conv") { num("conv")? as usize } else { 1 },
+            readout_last: if kv.contains_key("readout_last") { num("readout_last")? as usize } else { 0 },
+            probe: match kv.get("probe") {
+                Some(v) => v.parse().map_err(candle_core::Error::wrap)?,
+                None => 0.0,
+            },
         })
     }
 }
@@ -124,6 +169,14 @@ fn parse_prompt(s: &str) -> Result<Vec<u32>> {
 
 fn fmt_tokens(t: &[u32]) -> String {
     t.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(" ")
+}
+
+/// Token ids, followed by their words for the browsing task.
+fn fmt_task_tokens(task: Task, t: &[u32]) -> String {
+    match task {
+        Task::Browser => format!("{}  ⟨{}⟩", fmt_tokens(t), vocab::describe(t)),
+        _ => fmt_tokens(t),
+    }
 }
 
 fn configure_engine(engine: &mut CognitiveEngine, a: &Args) -> Result<()> {
@@ -179,10 +232,11 @@ fn cmd_train(a: &Args, demo: bool) -> Result<()> {
     let device = train_device(a)?;
     let model = CogModel::new(cfg.clone(), &device)?;
     println!(
-        "cog_engine | task={} vocab={} N=L={} | preset={} | {} params | train {:?}/{:?} | simd={} | rayon threads={}",
+        "cog_engine | task={} vocab={} N={} L={} | preset={} | {} params | train {:?}/{:?} | simd={} | rayon threads={}",
         meta.task.name(),
-        meta.vocab,
-        meta.len,
+        cfg.vocab_size,
+        cfg.max_prompt_len,
+        cfg.answer_len(),
         meta.preset,
         model.num_params(),
         device.location(),
@@ -195,7 +249,20 @@ fn cmd_train(a: &Args, demo: bool) -> Result<()> {
     if let Some(r) = &report {
         for (p, t, y) in &r.examples {
             let mark = if t == y { "✓" } else { "✗" };
-            println!("  {mark} prompt [{}] → target [{}] | engine [{}]", fmt_tokens(p), fmt_tokens(t), fmt_tokens(y));
+            match meta.task {
+                Task::Browser => println!(
+                    "  {mark} page ⟨{}⟩\n      → expert ⟨{}⟩ | engine ⟨{}⟩",
+                    vocab::describe(p),
+                    vocab::describe(t),
+                    vocab::describe(y)
+                ),
+                _ => println!(
+                    "  {mark} prompt [{}] → target [{}] | engine [{}]",
+                    fmt_tokens(p),
+                    fmt_tokens(t),
+                    fmt_tokens(y)
+                ),
+            }
         }
     }
     let out = a.get("out", if demo { "" } else { "model.safetensors" });
@@ -204,8 +271,15 @@ fn cmd_train(a: &Args, demo: bool) -> Result<()> {
         meta.save(&out)?;
         println!("saved {out} (+ {out}.cfg)");
     }
+    if meta.task == Task::Browser {
+        // Closed-loop quality: whole episodes in the simulated browser.
+        let mut policy = EnginePolicy::new(CognitiveEngine::from_model(&trainer.model)?);
+        println!("agent {}", browsing::step_accuracy(&mut policy, 1000, 99)?);
+        let r = browsing::evaluate(&mut SimBrowser::new(), &mut policy, SIM_ORIGIN, 200, 99, 10)?;
+        println!("agent (200 episodes, simulated browser): {r}");
+    }
     if demo {
-        bench(&mut CognitiveEngine::from_model(&trainer.model)?, meta.len, meta.vocab, 200)?;
+        bench(&mut CognitiveEngine::from_model(&trainer.model)?, 200)?;
     }
     Ok(())
 }
@@ -213,13 +287,14 @@ fn cmd_train(a: &Args, demo: bool) -> Result<()> {
 fn cmd_infer(a: &Args) -> Result<()> {
     let (mut engine, meta) = load_engine(a)?;
     let prompt = parse_prompt(&a.get("prompt", ""))?;
-    if prompt.len() != meta.len {
-        bail!("the checkpoint was trained on prompts of length {} (got {})", meta.len, prompt.len())
+    let n = engine.config().max_prompt_len;
+    if prompt.len() != n {
+        bail!("the checkpoint was trained on prompts of length {n} (got {})", prompt.len())
     }
     let (out, g) = engine.generate(&prompt, a.num("seed", 0)?)?;
-    println!("prompt : {}", fmt_tokens(&prompt));
-    println!("output : {}", fmt_tokens(&out));
-    println!("target : {}   ({})", fmt_tokens(&meta.task.apply(&prompt)), meta.task.name());
+    println!("prompt : {}", fmt_task_tokens(meta.task, &prompt));
+    println!("output : {}", fmt_task_tokens(meta.task, &out));
+    println!("target : {}   ({})", fmt_task_tokens(meta.task, &meta.task.apply(&prompt)), meta.task.name());
     println!(
         "plan   : energy {:.4} (warm start {:.4}), ESS {:.1}{}",
         g.plan.energy,
@@ -237,7 +312,8 @@ fn cmd_infer(a: &Args) -> Result<()> {
     Ok(())
 }
 
-fn bench(engine: &mut CognitiveEngine, len: usize, vocab: usize, iters: usize) -> Result<()> {
+fn bench(engine: &mut CognitiveEngine, iters: usize) -> Result<()> {
+    let (len, vocab) = (engine.config().max_prompt_len, engine.config().vocab_size);
     let m = engine.memory();
     println!(
         "memory : weights {:.1} KiB ({:?}) | arena {:.1} KiB in {} buffers | context state W_fast {} B (independent of N)",
@@ -280,24 +356,25 @@ fn bench(engine: &mut CognitiveEngine, len: usize, vocab: usize, iters: usize) -
 fn cmd_bench(a: &Args) -> Result<()> {
     let iters = a.num("iters", 200)?;
     if a.opts.contains_key("ckpt") {
-        let (mut engine, meta) = load_engine(a)?;
-        bench(&mut engine, meta.len, meta.vocab, iters)
+        let (mut engine, _) = load_engine(a)?;
+        bench(&mut engine, iters)
     } else {
         let meta = Meta::from_args(a)?;
         let model = CogModel::new(meta.config()?, &Device::Cpu)?;
         let mut engine = CognitiveEngine::from_model(&model)?;
         configure_engine(&mut engine, a)?;
         println!("(untrained weights — latency / memory only)");
-        bench(&mut engine, meta.len, meta.vocab, iters)
+        bench(&mut engine, iters)
     }
 }
 
 fn cmd_serve(a: &Args) -> Result<()> {
-    let (engine, meta) = load_engine(a)?;
+    let (engine, _) = load_engine(a)?;
+    let len = engine.config().max_prompt_len;
     let addr = a.get("addr", "127.0.0.1:7878");
     let engine = Arc::new(Mutex::new(engine));
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().map_err(candle_core::Error::wrap)?;
-    rt.block_on(serve(engine, meta.len, addr))
+    rt.block_on(serve(engine, len, addr))
 }
 
 async fn serve(engine: Arc<Mutex<CognitiveEngine>>, len: usize, addr: String) -> Result<()> {
@@ -342,6 +419,98 @@ async fn serve(engine: Arc<Mutex<CognitiveEngine>>, len: usize, addr: String) ->
     }
 }
 
+/// `--policy model` (default, needs `--ckpt`) or `--policy expert` (the scripted teacher).
+fn agent_policy(a: &Args) -> Result<Box<dyn Policy>> {
+    match a.get("policy", "model").as_str() {
+        "expert" => Ok(Box::new(ExpertPolicy)),
+        "model" => {
+            let (engine, meta) = load_engine(a)?;
+            if meta.task != Task::Browser {
+                bail!("the checkpoint was trained on '{}', not 'browser' (train with --task browser)", meta.task.name())
+            }
+            Ok(Box::new(EnginePolicy::new(engine)))
+        }
+        other => bail!("unknown policy '{other}' (model | expert)"),
+    }
+}
+
+/// The browser to act in and the origin of the sandbox web it sees. The site server (for
+/// Chromium) lives as long as the returned guard.
+fn agent_browser(a: &Args, default: &str) -> Result<(Box<dyn Browser>, String, Option<SiteServer>)> {
+    match a.get("browser", default).as_str() {
+        "sim" => Ok((Box::new(SimBrowser::new()), SIM_ORIGIN.to_string(), None)),
+        "chrome" | "chromium" => {
+            let server = SiteServer::start(&a.get("site-addr", "127.0.0.1:0"))?;
+            let opts = ChromeOptions {
+                executable: a.opts.get("chrome").map(Into::into),
+                headless: !a.opts.contains_key("headed"),
+                ..Default::default()
+            };
+            let chrome = Chrome::launch(&opts)?;
+            Ok((Box::new(chrome), server.origin(), Some(server)))
+        }
+        other => bail!("unknown browser '{other}' (chrome | sim)"),
+    }
+}
+
+fn cmd_agent(a: &Args) -> Result<()> {
+    let question = a.get("question", "what is the price of the lamp?");
+    let goal = Goal::parse(&question)?;
+    let world: u64 = a.num("world", 42)?;
+    let mut policy = agent_policy(a)?;
+    let (mut browser, origin, _server) = agent_browser(a, "chrome")?;
+    println!("question: {question}\ngoal    : {goal} | world {world} | site {origin}");
+    let ep =
+        browsing::run_episode(browser.as_mut(), policy.as_mut(), &origin, world, goal, a.num("max-steps", 10)?, |s| {
+            let action = s.action.map_or_else(|| "?".to_string(), |x| x.to_string());
+            println!("\n  {}", s.url);
+            println!("    sees   : {}", vocab::describe(&s.observation));
+            println!(
+                "    does   : {action:<24} ({:.1} ms){}",
+                1e3 * s.think_time.as_secs_f64(),
+                s.error.as_ref().map(|e| format!("  ✗ {e}")).unwrap_or_default()
+            );
+        })?;
+    println!();
+    match ep.answer {
+        Some(ans) => println!(
+            "answer  : {} {} (page says {}) in {} steps",
+            token_str(ans),
+            if ep.success() { "✓" } else { "✗" },
+            token_str(ep.truth),
+            ep.steps.len()
+        ),
+        None => println!("answer  : — (no answer in {} steps; the page says {})", ep.steps.len(), token_str(ep.truth)),
+    }
+    Ok(())
+}
+
+fn cmd_agent_eval(a: &Args) -> Result<()> {
+    let mut policy = agent_policy(a)?;
+    let (mut browser, origin, _server) = agent_browser(a, "sim")?;
+    let episodes = a.num("episodes", 100)?;
+    if a.opts.contains_key("steps") {
+        println!("{}", browsing::step_accuracy(policy.as_mut(), a.num("steps", 1000)?, a.num("seed", 1)?)?);
+    }
+    let r = browsing::evaluate(
+        browser.as_mut(),
+        policy.as_mut(),
+        &origin,
+        episodes,
+        a.num("seed", 1)?,
+        a.num("max-steps", 10)?,
+    )?;
+    println!("{} | {} | {r}", a.get("policy", "model"), a.get("browser", "sim"));
+    Ok(())
+}
+
+fn cmd_site(a: &Args) -> Result<()> {
+    let server = SiteServer::start(&a.get("addr", "127.0.0.1:8080"))?;
+    println!("sandbox web on {}/w/<world>/ (e.g. {}/w/42/) — Ctrl-C to stop", server.origin(), server.origin());
+    server.wait();
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let a = Args::parse()?;
     match a.cmd.as_str() {
@@ -350,6 +519,9 @@ fn main() -> Result<()> {
         "infer" => cmd_infer(&a),
         "bench" => cmd_bench(&a),
         "serve" => cmd_serve(&a),
-        other => bail!("unknown command '{other}' (demo | train | infer | bench | serve)"),
+        "agent" => cmd_agent(&a),
+        "agent-eval" => cmd_agent_eval(&a),
+        "site" => cmd_site(&a),
+        other => bail!("unknown command '{other}' (demo | train | infer | bench | serve | agent | agent-eval | site)"),
     }
 }

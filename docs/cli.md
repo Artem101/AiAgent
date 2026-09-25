@@ -21,7 +21,7 @@ cog_engine demo [--task sort] [--steps 1500] [флаги обучения]
 ### `train`
 
 ```bash
-cog_engine train --out model.safetensors [--task sort|reverse|copy] [--steps 1500] [--preset tiny|small]
+cog_engine train --out model.safetensors [--task sort|reverse|copy|browser] [--steps 1500] [--preset tiny|small]
                  [--vocab 10] [--len 8] [--batch 64] [--lr 2e-3] [--seed 7] [--eval-every 500]
                  [--device cpu|cuda] [--compute auto|f32|f16|bf16]
 ```
@@ -40,6 +40,11 @@ cog_engine train --out model.safetensors [--task sort|reverse|copy] [--steps 150
 | `--eval-every` | 500 | период оценки; 0 — без промежуточной оценки |
 | `--device` | `cpu` | `cuda` требует сборки с `--features cuda` |
 | `--compute` | `auto` | dtype прямого/обратного прохода; `auto` = f32 на CPU, bf16 на CUDA |
+| `--conv` | 1 (`browser`: 4) | `ttt.conv_width` |
+| `--readout-last` | 0 (`browser`: 3) | `ttt.readout_last` |
+| `--probe` | 0 (`browser`: 1.0) | `jepa.probe_weight` |
+
+Флаг без значения (`--headed`) можно ставить перед другим флагом.
 
 ### `infer`
 
@@ -114,6 +119,48 @@ TCP-сервер на tokio с построчным протоколом.
 printf '3 1 4 1 5 9 2 6\n' | nc 127.0.0.1 7878
 ```
 
+### `agent`
+
+Задать вопрос агенту-браузеру (чекпойнт обучен с `--task browser`, см. [browser.md](browser.md)).
+
+```bash
+cog_engine agent --ckpt agent.safetensors --question "Сколько стоит лампа?" [--world 42]
+                 [--browser chrome|sim] [--policy model|expert] [--max-steps 10]
+                 [--headed] [--chrome /path/to/chrome] [--site-addr 127.0.0.1:0]
+```
+
+| Флаг | По умолчанию | Смысл |
+|---|---|---|
+| `--question` | `what is the price of the lamp?` | вопрос на русском или английском: товар + атрибут (`price`, `color`, `brand`, `rating`) |
+| `--world` | 42 | номер мира песочницы (от него зависят все факты) |
+| `--browser` | `chrome` | `chrome` — настоящий Chromium, `sim` — симулятор |
+| `--policy` | `model` | `expert` — сценарий-учитель, `--ckpt` не нужен |
+| `--max-steps` | 10 | лимит действий |
+| `--headed` | нет | показать окно браузера (нужен дисплей) |
+| `--chrome` | поиск | путь к браузеру; иначе `COG_CHROME`, Playwright, `PATH` |
+
+Для каждого шага печатаются URL, что модель видит (токены наблюдения), что она делает и
+сколько думала. В конце — ответ и сверка с фактом мира.
+
+### `agent-eval`
+
+```bash
+cog_engine agent-eval --ckpt agent.safetensors [--episodes 100] [--browser sim|chrome]
+                      [--policy model|expert] [--steps 1000] [--seed 1] [--max-steps 10]
+```
+
+Прогоняет случайные задачи (мир + вопрос) и печатает успешность, число неверных ответов и
+эпизодов без ответа, среднее число шагов, долю ошибочных действий и время. `--steps N` добавляет
+точность отдельных шагов по типам действий на `N` случайных состояниях.
+
+### `site`
+
+```bash
+cog_engine site [--addr 127.0.0.1:8080]
+```
+
+Поднимает песочницу для обычного браузера: `http://127.0.0.1:8080/w/42/`.
+
 ## Файл `<ckpt>.cfg`
 
 ```
@@ -122,8 +169,13 @@ vocab=10
 len=8
 task=sort
 seed=7
+conv=1
+readout_last=0
+probe=0
 ```
 
-Этих полей достаточно, чтобы воссоздать `EngineConfig` через `EngineConfig::preset`. Если
+Этих полей достаточно, чтобы воссоздать `EngineConfig` через `EngineConfig::preset`. Поля
+`conv`, `readout_last` и `probe` (`ttt.conv_width`, `ttt.readout_last`, `jepa.probe_weight`)
+необязательны: в чекпойнтах, записанных до их появления, они принимают значения 1, 0 и 0. Если
 архитектура менялась вручную в коде, а не через пресет, CLI её не восстановит. В этом случае
 загружайте модель из кода с той же конфигурацией.

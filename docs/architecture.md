@@ -42,6 +42,11 @@ NewType-обёртка (`src/types.rs`), и перепутать их нельз
 `S_prompt` читается из `W_fast` обучаемыми пробами `P` и средним выходов слоя `z_t = W_t q_t`,
 затем проходит через MLP.
 
+Две опции (по умолчанию выключены, включены для задачи `browser`): `conv_width > 1` считает
+`k, v, q, η` из короткого каузального окна последних токенов, так что одно обновление связывает
+соседние токены; `readout_last > 0` добавляет в readout выходы `z_t` последних токенов, и вопрос в
+конце промпта работает как ассоциативный запрос к `W_fast`.
+
 | Файл | Что внутри |
 |---|---|
 | `fast_weights.rs` | `FastWeightsState` — сама матрица и шаг обновления; батчевые дифференцируемые версии для обучения |
@@ -149,7 +154,7 @@ cross-attention. ODE-решатель (Euler / Midpoint / Heun) за `K` шаг�
 ```
 src/
 ├── lib.rs            — корень крейта, реэкспорт главных типов
-├── main.rs           — CLI: demo / train / infer / bench / serve
+├── main.rs           — CLI: demo / train / infer / bench / serve / agent / agent-eval / site
 ├── config.rs         — EngineConfig (+ TTT/JEPA/Planner/Flow), TrainConfig, пресеты, validate()
 ├── types.rs          — PromptState, LatentState, LatentPlan, FlowState
 ├── arena.rs          — Arena: учёт и выдача предвыделенных буферов
@@ -164,6 +169,13 @@ src/
 ├── flow/             — модуль 3
 ├── model.rs          — CogModel: все модули + совместная функция потерь + чекпойнты
 ├── train.rs          — Trainer, EvalReport с абляциями планировщика
-├── data.rs           — синтетические задачи sort / reverse / copy
-└── pipeline.rs       — CognitiveEngine: инференс Tokens → Tokens
+├── data.rs           — задачи sort / reverse / copy / browser
+├── pipeline.rs       — CognitiveEngine: инференс Tokens → Tokens
+└── browser/          — агент-браузер (docs/browser.md)
+    ├── chrome.rs, cdp.rs — Chromium через DevTools: свой WebSocket, клики, ввод, история
+    ├── world.rs, server.rs — песочница: поисковик и страницы товаров, HTTP-сервер
+    ├── sim.rs        — симулятор браузера с тем же DOM (данные для обучения)
+    ├── obs.rs, vocab.rs — страница + цель → 24 токена; словарь, действия, разбор вопроса
+    ├── expert.rs, data.rs — учитель и обучающие состояния
+    └── agent.rs      — цикл «наблюдение → действие», эпизоды, оценка
 ```

@@ -1,3 +1,7 @@
 target/
 *.safetensors
 *.cfg
+
+# trained checkpoints shipped with the repository
+!models/*.safetensors
+!models/*.cfg

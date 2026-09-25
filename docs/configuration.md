@@ -26,6 +26,8 @@
 | `adaptive_lr` | true | true | η_t = η·σ(w·x̃_t + b) вместо константы |
 | `readout_probes` | 8 | 8 | число проб `r` для чтения `W_fast` |
 | `d_ctx` | 96 | 192 | ширина `S_prompt` |
+| `conv_width` | 1 | 1 | ширина `w` каузального окна перед проекциями: `k, v, q, η` токена считаются из `[LN(x_t); …; LN(x_{t−w+1})]`; 1 — только сам токен. Для браузера 4 |
+| `readout_last` | 0 | 0 | сколько последних выходов `z_N, z_{N−1}, …` добавить в readout (ассоциативный поиск по запросу в конце промпта). Для браузера 3 |
 
 ### `jepa: JepaConfig`
 
@@ -43,6 +45,7 @@
 | `vicreg.eps` | 1e-4 | | ε под корнем в variance |
 | `goal_weight` | 1.0 | | вес `‖ĝ − s̄_H‖²` |
 | `policy_weight` | 1.0 | | вес behaviour cloning политики |
+| `probe_weight` | 0.0 | | вес пробы ответа `CE(Linear(s_0) → токены ответа)`; > 0 добавляет голову `jepa.probe` (только для обучения). Для браузера 1.0 |
 
 ### `planner: PlannerConfig`
 
@@ -89,7 +92,7 @@ world model. Качество растёт с каждым множителем.
 
 | Поле | По умолчанию | Смысл |
 |---|---:|---|
-| `task` | аргумент | `Sort`, `Reverse`, `Copy` |
+| `task` | аргумент | `Sort`, `Reverse`, `Copy`, `Browser` |
 | `batch_size` | 64 | |
 | `steps` | 1500 | |
 | `lr` / `min_lr` | 2e-3 / 1e-4 | пик и минимум косинусного расписания |
@@ -113,4 +116,8 @@ world model. Качество растёт с каждым множителем.
 * `jepa.ema_decay ∈ [0, 1)`;
 * `vocab_size ≥ 2`.
 
-Задачи из `data.rs` дополнительно требуют `max_prompt_len == seq_len`. Это проверяет `TaskSampler::new`.
+* `ttt.conv_width ≥ 1`.
+
+Задачи `sort/reverse/copy` дополнительно требуют `max_prompt_len == seq_len`, задача `browser` —
+словарь 84, `N = 24`, `L = 4`. Это проверяет `TaskSampler::new`. Готовая конфигурация для
+браузера: `cog_engine::browser::engine_config(preset)`.

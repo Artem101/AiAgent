@@ -5,10 +5,12 @@
 //! ```text
 //!   L = L_CFM + λ_ce CE(head(x̂_1), y) + λ_head CE(head(X_1 + 0.1ε), y)
 //!       + λ_inv Inv + λ_var Var + λ_cov Cov + λ_goal ‖G(s_0) − s̄_H‖² + λ_π ‖π(ŝ_t, ĝ) − a_t‖²
+//!       [+ λ_probe CE(probe(s_0), y)]
 //! ```
 //!
 //! where `x̂_1 = X_t + (1 − t) v_θ` is the one-step estimate of the clean sample and the
-//! decoder is conditioned on the teacher-forced latent plan `[s_0, ŝ_1, …, ŝ_H]`.
+//! decoder is conditioned on the teacher-forced latent plan `[s_0, ŝ_1, …, ŝ_H]`. The answer
+//! probe is optional (`JepaConfig::probe_weight > 0`).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -54,6 +56,8 @@ pub struct LossReport {
     pub cov: f32,
     pub goal: f32,
     pub policy: f32,
+    /// Answer-probe cross-entropy (0 when the probe is disabled).
+    pub probe: f32,
 }
 
 impl LossReport {
@@ -68,6 +72,7 @@ impl LossReport {
         self.cov += o.cov;
         self.goal += o.goal;
         self.policy += o.policy;
+        self.probe += o.probe;
     }
     /// Multiplies every term by `s`.
     pub fn scaled(&self, s: f32) -> Self {
@@ -81,6 +86,7 @@ impl LossReport {
             cov: self.cov * s,
             goal: self.goal * s,
             policy: self.policy * s,
+            probe: self.probe * s,
         }
     }
 }
@@ -91,7 +97,11 @@ impl std::fmt::Display for LossReport {
             f,
             "loss {:.4} | cfm {:.4} ce {:.4} head {:.4} | inv {:.4} var {:.4} cov {:.4} goal {:.4} π {:.4}",
             self.total, self.cfm, self.ce, self.head, self.inv, self.var, self.cov, self.goal, self.policy
-        )
+        )?;
+        if self.probe != 0.0 {
+            write!(f, " probe {:.4}", self.probe)?;
+        }
+        Ok(())
     }
 }
 
@@ -159,13 +169,19 @@ impl CogModel {
         // TTT → JEPA
         let readouts = self.readouts(batch, cd)?;
         let (mut plan, terms) = self.jepa.forward_train(&readouts, &self.cfg.jepa)?;
+        let targets = batch.answer.flatten_all()?;
+        let mut probe_ce = None;
+        if let Some(probe) = &self.jepa.probe {
+            let s0 = plan.narrow(1, 0, 1)?.squeeze(1)?;
+            let logits = probe.forward(&s0)?.to_dtype(DType::F32)?.reshape((b * l, vocab))?;
+            probe_ce = Some(candle_nn::loss::cross_entropy(&logits, &targets)?);
+        }
         if tc.plan_noise > 0.0 {
             let noise = randn(rng, plan.dims(), tc.plan_noise as f32, &self.device)?.to_dtype(cd)?;
             plan = (plan + noise)?;
         }
 
         // CFM on the conditional OT path
-        let targets = batch.answer.flatten_all()?;
         let x1 = self.out_emb.index_select(&targets, 0)?.reshape((b, l, dt))?.to_dtype(cd)?;
         let x0 = randn(rng, &[b, l, dt], 1.0, &self.device)?.to_dtype(cd)?;
         let mut tv = vec![0f32; b];
@@ -184,8 +200,11 @@ impl CogModel {
         let head_logits = self.head.forward(&noisy)?.to_dtype(DType::F32)?.reshape((b * l, vocab))?;
         let head_ce = candle_nn::loss::cross_entropy(&head_logits, &targets)?;
 
-        let total =
+        let mut total =
             ((((&cfm + (&ce * tc.ce_weight)?)? + (&head_ce * tc.head_weight)?)?) + terms.weighted(&self.cfg.jepa)?)?;
+        if let Some(p) = &probe_ce {
+            total = (total + (p * self.cfg.jepa.probe_weight)?)?;
+        }
         let s = |t: &Tensor| t.to_dtype(DType::F32)?.to_scalar::<f32>();
         let report = LossReport {
             total: s(&total)?,
@@ -197,6 +216,7 @@ impl CogModel {
             cov: s(&terms.covariance)?,
             goal: s(&terms.goal)?,
             policy: s(&terms.policy)?,
+            probe: probe_ce.as_ref().map(s).transpose()?.unwrap_or(0.0),
         };
         Ok((total, report))
     }

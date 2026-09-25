@@ -1,7 +1,9 @@
-//! Synthetic sequence-transduction tasks used to train and evaluate the engine.
+//! Tasks used to train and evaluate the engine: synthetic sequence transduction and
+//! web browsing ([`Task::Browser`], see [`crate::browser`]).
 
 use candle_core::{bail, Device, Result, Tensor};
 
+use crate::browser;
 use crate::kernels::rng::Rng;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12,6 +14,9 @@ pub enum Task {
     Reverse,
     /// Output the prompt unchanged.
     Copy,
+    /// Web browsing: the prompt is an observation of a page plus a goal, the answer is the
+    /// next browser action (see [`crate::browser::obs`] and [`crate::browser::expert`]).
+    Browser,
 }
 
 impl Task {
@@ -20,7 +25,8 @@ impl Task {
             "sort" => Ok(Self::Sort),
             "reverse" => Ok(Self::Reverse),
             "copy" => Ok(Self::Copy),
-            other => bail!("unknown task '{other}' (expected sort | reverse | copy)"),
+            "browser" => Ok(Self::Browser),
+            other => bail!("unknown task '{other}' (expected sort | reverse | copy | browser)"),
         }
     }
 
@@ -30,16 +36,27 @@ impl Task {
             Self::Sort => "sort",
             Self::Reverse => "reverse",
             Self::Copy => "copy",
+            Self::Browser => "browser",
         }
     }
 
-    /// The correct answer for `prompt`.
+    /// `(vocab, prompt length N, answer length L)` for the requested `vocab` / `len`. The
+    /// browsing task has a fixed vocabulary and fixed observation / action lengths.
+    pub fn dims(&self, vocab: usize, len: usize) -> (usize, usize, usize) {
+        match self {
+            Self::Browser => (browser::VOCAB_SIZE, browser::OBS_LEN, browser::ACTION_LEN),
+            _ => (vocab, len, len),
+        }
+    }
+
+    /// The correct answer for `prompt` (for [`Task::Browser`]: the expert's next action).
     pub fn apply(&self, prompt: &[u32]) -> Vec<u32> {
         let mut out = prompt.to_vec();
         match self {
             Self::Sort => out.sort_unstable(),
             Self::Reverse => out.reverse(),
             Self::Copy => {}
+            Self::Browser => return browser::expert::act_tokens(prompt).to_vec(),
         }
         out
     }
@@ -66,7 +83,12 @@ pub struct TaskSampler {
 
 impl TaskSampler {
     pub fn new(task: Task, vocab: usize, prompt_len: usize, answer_len: usize) -> Result<Self> {
-        if prompt_len != answer_len {
+        if task == Task::Browser {
+            let want = task.dims(vocab, prompt_len);
+            if (vocab, prompt_len, answer_len) != want {
+                bail!("task 'browser' needs (vocab, N, L) = {want:?}, got ({vocab}, {prompt_len}, {answer_len})")
+            }
+        } else if prompt_len != answer_len {
             bail!("task '{}' maps N tokens to N tokens (got N={prompt_len}, L={answer_len})", task.name())
         }
         Ok(Self { task, vocab, prompt_len, answer_len })
@@ -74,6 +96,10 @@ impl TaskSampler {
 
     /// One `(prompt, answer)` pair.
     pub fn example(&self, rng: &mut Rng) -> (Vec<u32>, Vec<u32>) {
+        if self.task == Task::Browser {
+            let (observation, action) = browser::data::example(rng);
+            return (observation.to_vec(), action.to_vec());
+        }
         let prompt: Vec<u32> = (0..self.prompt_len).map(|_| rng.below(self.vocab) as u32).collect();
         let answer = self.task.apply(&prompt);
         (prompt, answer)

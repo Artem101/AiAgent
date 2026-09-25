@@ -2,9 +2,10 @@
 //!
 //! `tokens → (embedding + position + segment) → TTT-Linear scan over W_fast → readout`.
 //!
-//! Readout of the final fast weights uses learned probes `P ∈ ℝ^{d_fast×r}` and the running
-//! mean of the layer outputs:
-//! `S_prompt = MLP(LN([vec(W_fast^{(N)} P) ; mean_t z_t]))` — O(d²) memory, independent of N.
+//! Readout of the final fast weights uses learned probes `P ∈ ℝ^{d_fast×r}`, the running
+//! mean of the layer outputs and, optionally, the last `m = readout_last` outputs:
+//! `S_prompt = MLP(LN([vec(W_fast^{(N)} P) ; mean_t z_t ; z_N ; … ; z_{N−m+1}]))` — O(d²)
+//! memory, independent of N.
 
 pub mod fast_weights;
 pub mod layer;
@@ -16,7 +17,9 @@ pub use layer::{PackedTttLinear, TttLinear, TttSnapshot};
 
 use crate::arena::Arena;
 use crate::config::EngineConfig;
-use crate::kernels::{add_inplace, gelu_inplace, inplace, layer_norm_rows, PackedLinear, PackedMlp, WeightBuf};
+use crate::kernels::{
+    add_inplace, gelu_inplace, inplace, layer_norm_rows, layer_norm_rows_into, PackedLinear, PackedMlp, WeightBuf,
+};
 use crate::nn::{self, Init, Lin, Mlp, ParamStore};
 use crate::types::PromptState;
 
@@ -36,6 +39,8 @@ pub struct TttEncoder {
     /// Probe matrix stored as a bias-free linear layer with weight `Pᵀ ∈ ℝ^{r×d_fast}`.
     pub probes: Lin,
     pub readout: Mlp,
+    /// Number of final layer outputs fed to the readout.
+    pub readout_last: usize,
 }
 
 impl TttEncoder {
@@ -47,7 +52,13 @@ impl TttEncoder {
             seg_emb: ps.tensor("ttt.seg_emb", &[2, t.d_model], Init::Normal(0.5))?,
             layer: TttLinear::new(ps, "ttt.layer", t)?,
             probes: ps.linear("ttt.probes", t.d_fast, t.readout_probes, false)?,
-            readout: ps.mlp("ttt.readout", t.d_fast * t.readout_probes + t.d_fast, t.d_ctx, t.d_ctx)?,
+            readout: ps.mlp(
+                "ttt.readout",
+                t.d_fast * t.readout_probes + t.d_fast * (1 + t.readout_last),
+                t.d_ctx,
+                t.d_ctx,
+            )?,
+            readout_last: t.readout_last,
         })
     }
 
@@ -70,13 +81,15 @@ impl TttEncoder {
         let (b, d, _) = snap.w.dims3()?;
         let r = self.probes.d_out();
         let probed = self.probes.forward(&snap.w)?.reshape((b, d * r))?; // vec(W P)
-        let feat = Tensor::cat(&[probed, snap.z_mean.clone()], 1)?;
+        let mut parts = vec![probed, snap.z_mean.clone()];
+        parts.extend(snap.z_last.iter().cloned());
+        let feat = Tensor::cat(&parts, 1)?;
         self.readout.forward(&nn::layer_norm(&feat)?)
     }
 
     /// Readouts `S` after each prefix length in `snapshots`.
     pub fn encode_snapshots(&self, x: &Tensor, snapshots: &[usize]) -> Result<Vec<Tensor>> {
-        self.layer.scan(x, snapshots)?.iter().map(|s| self.readout(s)).collect()
+        self.layer.scan(x, snapshots, self.readout_last)?.iter().map(|s| self.readout(s)).collect()
     }
 
     /// `prompt: [B, N]` → `S_prompt: [B, d_ctx]` (graph path).
@@ -98,6 +111,7 @@ impl TttEncoder {
             vocab,
             max_pos: self.pos_emb.dims()[0],
             d_model,
+            readout_last: self.readout_last,
         })
     }
 }
@@ -114,18 +128,22 @@ pub struct PackedTttEncoder {
     pub vocab: usize,
     pub max_pos: usize,
     pub d_model: usize,
+    pub readout_last: usize,
 }
 
 /// Pre-allocated buffers of [`PackedTttEncoder`] (O(d²), independent of the context length).
 #[derive(Debug)]
 pub struct TttWorkspace {
     x: Box<[f32]>,
+    /// Causal window `[LN(x_t); LN(x_{t−1}); …]`.
     xn: Box<[f32]>,
     k: Box<[f32]>,
     v: Box<[f32]>,
     q: Box<[f32]>,
     z: Box<[f32]>,
     z_sum: Box<[f32]>,
+    /// The last `readout_last` outputs, newest first.
+    z_last: Box<[f32]>,
     feat: Box<[f32]>,
     hidden: Box<[f32]>,
     /// Fast weights `W_fast`.
@@ -152,12 +170,13 @@ impl PackedTttEncoder {
         let (dm, df) = (self.d_model, self.d_fast());
         Ok(TttWorkspace {
             x: arena.host(dm),
-            xn: arena.host(dm),
+            xn: arena.host(dm * self.layer.conv_width),
             k: arena.host(df),
             v: arena.host(df),
             q: arena.host(df),
             z: arena.host(df),
             z_sum: arena.host(df),
+            z_last: arena.host(df * self.readout_last),
             feat: arena.host(self.readout.l1.d_in),
             hidden: arena.host(self.readout.l1.d_out),
             state: FastWeightsState::in_arena(arena, df, self.layer.eta as f64)?,
@@ -169,12 +188,14 @@ impl PackedTttEncoder {
     /// Clears the fast weights for a new context.
     pub fn reset(&self, ws: &mut TttWorkspace) -> Result<()> {
         ws.state.reset()?;
+        ws.xn.fill(0.0);
         ws.z_sum.fill(0.0);
+        ws.z_last.fill(0.0);
         ws.n_tokens = 0;
         Ok(())
     }
 
-    /// Absorbs one token: embed → project → `W ← W − η_t (W k − v) ⊗ k` → `z = W q`.
+    /// Absorbs one token: embed → causal window → project → `W ← W − η_t (W k − v) ⊗ k` → `z = W q`.
     /// Positions beyond the learned table reuse its last row, so the stream length is unbounded.
     pub fn absorb(&self, token: u32, segment: usize, ws: &mut TttWorkspace) -> Result<()> {
         if token as usize >= self.vocab {
@@ -185,23 +206,33 @@ impl PackedTttEncoder {
         self.tok_emb.row_into(token as usize, dm, &mut ws.x);
         self.pos_emb.add_row_into(pos, dm, &mut ws.x);
         self.seg_emb.add_row_into(segment, dm, &mut ws.x);
-        let eta = self.layer.project(&ws.x, &mut ws.xn, &mut ws.k, &mut ws.v, &mut ws.q);
+        // Shift the window by one token and normalise the new one into slot 0.
+        let len = ws.xn.len();
+        ws.xn.copy_within(..len - dm, dm);
+        layer_norm_rows_into(&ws.x, &mut ws.xn[..dm], dm);
+        let eta = self.layer.project(&ws.xn, &mut ws.k, &mut ws.v, &mut ws.q);
         ws.state.step_update_host(&ws.k, &ws.v, eta)?;
         ws.state.forward_host(&ws.q, &mut ws.z)?;
         add_inplace(&mut ws.z_sum, &ws.z);
+        if !ws.z_last.is_empty() {
+            let (len, df) = (ws.z_last.len(), ws.z.len());
+            ws.z_last.copy_within(..len - df, df);
+            ws.z_last[..df].copy_from_slice(&ws.z);
+        }
         ws.n_tokens += 1;
         Ok(())
     }
 
     /// Reads `S_prompt` out of the current fast weights.
     pub fn finish(&self, ws: &mut TttWorkspace) -> Result<PromptState> {
-        let TttWorkspace { feat, z_sum, hidden, state, prompt, n_tokens, .. } = ws;
-        let rd = self.d_fast() * self.probes.d_out;
+        let TttWorkspace { feat, z_sum, z_last, hidden, state, prompt, n_tokens, .. } = ws;
+        let (rd, df) = (self.d_fast() * self.probes.d_out, self.d_fast());
         inplace::host_read(&state.weights, |w| self.probes.forward(w, &mut feat[..rd]))?;
         let inv = if *n_tokens > 0 { 1.0 / *n_tokens as f32 } else { 0.0 };
-        for (f, &z) in feat[rd..].iter_mut().zip(z_sum.iter()) {
+        for (f, &z) in feat[rd..rd + df].iter_mut().zip(z_sum.iter()) {
             *f = z * inv;
         }
+        feat[rd + df..].copy_from_slice(z_last);
         let n = feat.len();
         layer_norm_rows(feat, n);
         self.readout.l1.forward(feat, hidden);
@@ -239,8 +270,16 @@ mod tests {
 
     #[test]
     fn packed_encoder_matches_graph() -> Result<()> {
+        encoder_parity(EngineConfig::tiny(11, 6, 4))?;
+        // causal window over 3 tokens + the last 2 outputs in the readout
+        let mut cfg = EngineConfig::tiny(11, 6, 4);
+        cfg.ttt.conv_width = 3;
+        cfg.ttt.readout_last = 2;
+        encoder_parity(cfg)
+    }
+
+    fn encoder_parity(cfg: EngineConfig) -> Result<()> {
         let dev = Device::Cpu;
-        let cfg = EngineConfig::tiny(11, 6, 4);
         let mut ps = ParamStore::new(&dev, 3);
         let enc = TttEncoder::new(&mut ps, &cfg)?;
         let tokens: Vec<u32> = vec![3, 1, 4, 1, 5, 9];

@@ -15,6 +15,43 @@ tokens ─► TTT-Encoder ─► S_prompt ─► E_θ ─► s_0 ─► JEPA-п�
 * Всё детерминировано: собственный seeded RNG, у каждого MPPI-сэмпла свой поток `(seed, iter, m)`,
   поэтому результат бит-в-бит совпадает при любом числе потоков.
 
+## Агент-браузер
+
+Движок умеет **искать информацию в настоящем браузере**. Модель смотрит на страницу в headless
+Chromium, решает, что сделать (ввести запрос, нажать кнопку, открыть ссылку, вернуться назад), и
+отвечает, когда нашла нужное. Обученная модель лежит в `models/browser_agent.safetensors`.
+
+```bash
+cargo run --release -- agent --ckpt models/browser_agent.safetensors --question "Сколько стоит лампа?"
+```
+
+```
+  http://127.0.0.1:43293/w/42/
+    sees   : [head] search [input] <empty> [button] search <goal> lamp price
+    does   : TYPE "lamp"              (5.7 ms)
+
+  http://127.0.0.1:43293/w/42/
+    sees   : [head] search [input] lamp [button] search <goal> lamp price
+    does   : CLICK button "search"    (6.8 ms)
+
+  http://127.0.0.1:43293/w/42/search?q=lamp
+    sees   : [head] results [input] lamp [button] search [link] bike [link] lamp [link] laptop [link] jacket [link] home <goal> lamp price
+    does   : CLICK link "lamp"        (6.1 ms)
+
+  http://127.0.0.1:43293/w/42/item/lamp
+    sees   : [head] lamp [link] home [label] brand [value] delta [label] price [value] 10 [label] color [value] blue [label] rating [value] 5 <goal> lamp price
+    does   : ANSWER "10"              (5.7 ms)
+
+answer  : 10 ✓ (page says 10) in 4 steps
+```
+
+**98.2% верных ответов на 500 новых задачах в настоящем Chromium** (4 шага на задачу, ~6 мс на
+решение модели). Факты на сайте-песочнице случайны для каждого «мира», поэтому ответ нельзя
+запомнить, его нужно найти и прочитать. Chromium управляется собственным CDP-клиентом
+(WebSocket + JSON-RPC, без новых тяжёлых зависимостей). Модель учится на симуляторе, который
+совпадает с Chromium элемент в элемент (это проверяет тест). Подробности, ограничения и что
+пришлось изменить в движке — в [docs/browser.md](docs/browser.md).
+
 ## Документация
 
 Подробная документация лежит в [`docs/`](docs/README.md):
@@ -29,6 +66,7 @@ tokens ─► TTT-Encoder ─► S_prompt ─► E_θ ─► s_0 ─► JEPA-п�
 | [configuration.md](docs/configuration.md) | все поля конфигурации и пресеты |
 | [runtime.md](docs/runtime.md) | арена, «0 аллокаций», точность, SIMD, параллелизм, детерминизм, скорость |
 | [development.md](docs/development.md) | тесты, инварианты, рецепты расширения, ограничения |
+| [browser.md](docs/browser.md) | агент-браузер: Chromium, песочница, наблюдения и действия, обучение, результаты |
 
 Примеры: `cargo run --release --example quickstart` (обучение → инференс) и
 `cargo run --release --example staged` (API по стадиям).
@@ -152,9 +190,14 @@ cargo run --release -- train --task sort --steps 1500 --out model.safetensors
 cargo run --release -- infer --ckpt model.safetensors --prompt "3 1 4 1 5 9 2 6" [--planner mppi+gd] [--solver heun --ode-steps 16]
 cargo run --release -- bench --ckpt model.safetensors
 cargo run --release -- serve --ckpt model.safetensors --addr 127.0.0.1:7878   # одна строка токенов → одна строка ответа
+
+# агент-браузер
+RAYON_NUM_THREADS=1 cargo run --release -- train --task browser --steps 8000 --out agent.safetensors   # ~12 мин
+cargo run --release -- agent --ckpt agent.safetensors --question "какого цвета велосипед"
+cargo run --release -- agent-eval --ckpt agent.safetensors --browser chrome --episodes 200
 ```
 
-Задачи: `sort`, `reverse`, `copy`. Пресеты: `tiny`, `small`. Точность: `--compute auto|f32|f16|bf16`.
+Задачи: `sort`, `reverse`, `copy`, `browser`. Пресеты: `tiny`, `small`. Точность: `--compute auto|f32|f16|bf16`.
 Устройство обучения: `--device cpu|cuda`.
 
 Как библиотека:
@@ -170,7 +213,7 @@ let gen = engine.generate_into(&[3, 1, 4, 1, 5, 9, 2, 6], /*seed*/ 0, &mut out)?
 
 ## Тесты
 
-`cargo test` — 26 тестов:
+`cargo test` — 41 тест:
 * **паритет graph ↔ kernel**: TTT-энкодер, векторное поле DiT (f32 и bf16), роллаут world model,
   фьюзнутый rank-1 шаг против эталонного кода из спецификации, `dot/dot4` SIMD против portable-версии;
 * **математика**: порядок сходимости Euler/Midpoint/Heun, концы OT-пути, VICReg штрафует коллапс
@@ -180,7 +223,11 @@ let gen = engine.generate_into(&[3, 1, 4, 1, 5, 9, 2, 6], /*seed*/ 0, &mut out)?
 * **`tests/zero_alloc.rs`**: 0 аллокаций в `step_update` (10 000 шагов), `FlowMatchingSampler`,
   `plan_into` и полном `generate_into` — последовательно и под rayon;
 * **`tests/pipeline.rs`**: обучение снижает loss, чекпойнт восстанавливается бит-в-бит,
-  генерация детерминирована, память контекста не растёт на промпте из 500 токенов.
+  генерация детерминирована, память контекста не растёт на промпте из 500 токенов;
+* **агент-браузер** (`src/browser/*`, `tests/browser.rs`): словарь, действия и разбор вопросов;
+  миры, маршруты и HTTP-сервер; кадры WebSocket; учитель решает 300 задач и выходит из ошибок;
+  **снимки симулятора и Chromium совпадают элемент в элемент**; обученный движок управляет
+  обоими браузерами. Тесты с Chromium пропускаются, если браузер не найден.
 
 ## Структура
 
@@ -188,7 +235,7 @@ let gen = engine.generate_into(&[3, 1, 4, 1, 5, 9, 2, 6], /*seed*/ 0, &mut out)?
 AiAgent/                         # корень репозитория = крейт cog_engine
 ├── Cargo.toml
 ├── src/
-│   ├── lib.rs, main.rs          # библиотека и CLI (demo/train/infer/bench/serve)
+│   ├── lib.rs, main.rs          # библиотека и CLI (demo/train/infer/bench/serve/agent/agent-eval/site)
 │   ├── config.rs                # TTT/JEPA/Planner/Flow/Train конфиги, пресеты
 │   ├── types.rs                 # NewType: PromptState, LatentState, LatentPlan, FlowState
 │   ├── arena.rs                 # предвыделенные буферы и тензоры
@@ -199,7 +246,10 @@ AiAgent/                         # корень репозитория = кре�
 │   ├── flow/{mod,vector_field,ode_solver}.rs
 │   ├── model.rs                 # совместная функция потерь, save/load
 │   ├── train.rs                 # AdamW, warmup+cosine, clip, EMA, оценка с абляциями
-│   ├── data.rs                  # синтетические задачи
-│   └── pipeline.rs              # CognitiveEngine: Tokens → TTT → JEPA → CFM → Tokens
-└── tests/{zero_alloc,pipeline}.rs
+│   ├── data.rs                  # задачи: sort/reverse/copy и browser
+│   ├── pipeline.rs              # CognitiveEngine: Tokens → TTT → JEPA → CFM → Tokens
+│   └── browser/                 # агент-браузер: chrome+cdp, world+server, sim, obs, vocab, expert, data, agent
+├── models/browser_agent.safetensors   # обученный агент-браузер (+ .cfg)
+├── examples/{quickstart,staged,browser_agent}.rs
+└── tests/{zero_alloc,pipeline,browser}.rs
 ```

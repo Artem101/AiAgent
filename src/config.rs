@@ -20,6 +20,14 @@ pub struct TTTConfig {
     pub readout_probes: usize,
     /// Width of the prompt state `S_prompt` produced by the readout MLP.
     pub d_ctx: usize,
+    /// Width `w` of the causal convolution in front of the projections: `k, v, q, η` of token
+    /// `t` are computed from `[LN(x_t); LN(x_{t−1}); …; LN(x_{t−w+1})]` (`1` = the token
+    /// alone). With `w > 1` a single rank-1 update can bind neighbouring tokens, e.g. a
+    /// table label (key) to the value next to it.
+    pub conv_width: usize,
+    /// Number of final layer outputs `z_N, z_{N−1}, …` appended to the readout (`0` = none).
+    /// A question at the end of the prompt then acts as an associative lookup into `W_fast`.
+    pub readout_last: usize,
 }
 
 /// VICReg anti-collapse regulariser weights.
@@ -51,6 +59,10 @@ pub struct JepaConfig {
     pub goal_weight: f64,
     /// Weight of the behaviour-cloning loss of the proposal policy `π(s, ĝ)`.
     pub policy_weight: f64,
+    /// Weight of the answer-probe loss `CE(Linear(s_0) → answer tokens)`: the initial latent
+    /// state must linearly decode into the answer, which gives the encoder a direct signal
+    /// to extract it from the prompt. `0` = no probe head (it is used only in training).
+    pub probe_weight: f64,
 }
 
 /// Which trajectory optimiser runs at inference time.
@@ -133,6 +145,8 @@ impl EngineConfig {
                 adaptive_lr: true,
                 readout_probes: 8,
                 d_ctx: 96,
+                conv_width: 1,
+                readout_last: 0,
             },
             jepa: JepaConfig {
                 d_state: 32,
@@ -143,6 +157,7 @@ impl EngineConfig {
                 vicreg: VicRegConfig { inv_weight: 1.0, var_weight: 0.5, cov_weight: 0.04, gamma: 1.0, eps: 1e-4 },
                 goal_weight: 1.0,
                 policy_weight: 1.0,
+                probe_weight: 0.0,
             },
             planner: PlannerConfig {
                 kind: PlannerKind::Mppi,
@@ -227,6 +242,9 @@ impl EngineConfig {
                 f.seq_len,
                 self.jepa.horizon
             )
+        }
+        if self.ttt.conv_width == 0 {
+            bail!("ttt.conv_width must be >= 1")
         }
         if f.solver.steps == 0 {
             bail!("flow.solver.steps must be > 0")

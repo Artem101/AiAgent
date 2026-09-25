@@ -27,7 +27,7 @@ pub use world_model::{PackedWorldModel, WorldModel};
 
 use crate::config::{EngineConfig, JepaConfig};
 use crate::kernels::PackedMlp;
-use crate::nn::{self, Mlp, ParamStore};
+use crate::nn::{self, Lin, Mlp, ParamStore};
 use vicreg::VicRegLoss;
 
 #[derive(Debug, Clone)]
@@ -39,6 +39,8 @@ pub struct Jepa {
     pub inverse: Mlp,
     pub goal: Mlp,
     pub policy: Mlp,
+    /// Answer probe `s_0 → [L · vocab]` logits (training only; see `JepaConfig::probe_weight`).
+    pub probe: Option<Lin>,
 }
 
 /// Individual (unweighted) JEPA loss terms.
@@ -73,6 +75,11 @@ impl Jepa {
             inverse: online.mlp("jepa.inverse", 2 * j.d_state, j.d_hidden, j.d_action)?,
             goal: online.mlp("jepa.goal", j.d_state, j.d_hidden, j.d_state)?,
             policy: online.mlp("jepa.policy", 2 * j.d_state, j.d_hidden, j.d_action)?,
+            probe: if j.probe_weight > 0.0 {
+                Some(online.linear("jepa.probe", j.d_state, cfg.answer_len() * cfg.vocab_size, true)?)
+            } else {
+                None
+            },
         };
         Self::ema(online, target, 0.0)?; // Ē ← E
         Ok(jepa)
