@@ -385,6 +385,9 @@ pub fn dialog_turns(turns: &[String]) -> (Vec<Turn>, String) {
 
 /// Some unrelated earlier conversation (a random excerpt, one or two turns).
 fn stray_history(rng: &mut Rng, dialogs: &[Dialog]) -> Vec<Turn> {
+    if rng.uniform() < 0.5 {
+        return agent_history(rng);
+    }
     let d = &dialogs[rng.below(dialogs.len())];
     let mut all: Vec<String> = d.turns.clone();
     all.push(d.reply.clone());
@@ -396,6 +399,23 @@ fn stray_history(rng: &mut Rng, dialogs: &[Dialog]) -> Vec<Turn> {
         .enumerate()
         .map(|(i, t)| if (turns.len() - i) % 2 == 1 { Turn::bot(t.clone()) } else { Turn::user(t.clone()) })
         .collect()
+}
+
+/// Earlier exchanges with the agent itself: one to three questions of the browsing families
+/// (a phrase, a price, a sum…) with the teacher's answers — what a conversation with the agent
+/// looks like after a few lines.
+fn agent_history(rng: &mut Rng) -> Vec<Turn> {
+    use crate::browser::world::World;
+    let mut turns = Vec::new();
+    for _ in 0..1 + rng.below(3) {
+        let world = World::new(rng.below(1 << 30) as u64);
+        let f = bdata::family(rng);
+        let g = crate::browser::goal::sample(rng, &world, f, Split::Train);
+        let spec = g.spec.expect("sampled goals have a spec");
+        turns.push(Turn::user(g.text));
+        turns.push(Turn::bot(spec.answer_sentence(&world)));
+    }
+    turns
 }
 
 /// A user's line as people type it: now and then all in lower case or (a short one) in capitals.

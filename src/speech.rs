@@ -75,7 +75,8 @@ pub struct Sampling {
     pub temperature: f32,
     /// Sample among the `top_k` most likely tokens (`0` = all).
     pub top_k: usize,
-    /// The first `greedy_prefix` tokens are always greedy (the verb and role of an action).
+    /// The first `greedy_prefix` tokens are always greedy (the verb and role of an action);
+    /// only the text of an `ANSWER` is ever sampled.
     pub greedy_prefix: usize,
     /// Divides the probability of a word already said in this utterance (`1` = off). Only
     /// word pieces (two letters or more) are penalised: digits and punctuation repeat freely.
@@ -411,7 +412,10 @@ impl SpeechDecoder {
                         }
                     }
                 }
-                let greedy = sampling.temperature <= 0.0 || step < sampling.greedy_prefix;
+                // only the text of a reply is sampled: the arguments of browser actions and tool
+                // calls (a query, an expression, a word) stay greedy
+                let reply = said[r].first() == Some(&crate::text::ANSWER);
+                let greedy = sampling.temperature <= 0.0 || step < sampling.greedy_prefix || !reply;
                 let tok = if greedy { argmax(&dist) } else { sample(&dist, sampling, rng) };
                 logp[r] += dist[tok as usize].max(1e-30).ln();
                 said[r].push(tok);

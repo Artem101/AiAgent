@@ -9,37 +9,40 @@ text{fill:var(--ink2);font-size:12px}.t{fill:var(--ink);font-size:14px;font-weig
 <line class="a" x1="56" x2="670" y1="294.0" y2="294.0"/>
 <text x="48" y="298.0" text-anchor="end">0</text>
 <line class="g" x1="56" x2="670" y1="244.0" y2="244.0"/>
-<text x="48" y="248.0" text-anchor="end">12</text>
+<text x="48" y="248.0" text-anchor="end">16</text>
 <line class="g" x1="56" x2="670" y1="194.0" y2="194.0"/>
-<text x="48" y="198.0" text-anchor="end">24</text>
+<text x="48" y="198.0" text-anchor="end">32</text>
 <line class="g" x1="56" x2="670" y1="144.0" y2="144.0"/>
-<text x="48" y="148.0" text-anchor="end">36</text>
+<text x="48" y="148.0" text-anchor="end">48</text>
 <line class="g" x1="56" x2="670" y1="94.0" y2="94.0"/>
-<text x="48" y="98.0" text-anchor="end">48</text>
+<text x="48" y="98.0" text-anchor="end">64</text>
 <line class="g" x1="56" x2="670" y1="44.0" y2="44.0"/>
-<text x="48" y="48.0" text-anchor="end">60</text>
+<text x="48" y="48.0" text-anchor="end">80</text>
 <text x="56.0" y="312" text-anchor="middle">0</text>
-<text x="209.5" y="312" text-anchor="middle">2000</text>
-<text x="363.0" y="312" text-anchor="middle">4000</text>
-<text x="516.5" y="312" text-anchor="middle">6000</text>
-<text x="670.0" y="312" text-anchor="middle">8000</text>
+<text x="192.4" y="312" text-anchor="middle">2000</text>
+<text x="328.9" y="312" text-anchor="middle">4000</text>
+<text x="465.3" y="312" text-anchor="middle">6000</text>
+<text x="601.8" y="312" text-anchor="middle">8000</text>
+<text x="670.0" y="312" text-anchor="middle">9000</text>
 <text x="670" y="326" text-anchor="end">шаг обучения</text>
-<path d="M209.5,194.0 L363.0,139.8 L516.5,94.0 L670.0,69.0" fill="none" stroke="var(--s0)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
-<circle cx="209.5" cy="194.0" r="4" fill="var(--s0)" stroke="var(--surface)" stroke-width="2"><title>агент · шаг 2000: 24.0%</title></circle>
-<circle cx="363.0" cy="139.8" r="4" fill="var(--s0)" stroke="var(--surface)" stroke-width="2"><title>агент · шаг 4000: 37.0%</title></circle>
-<circle cx="516.5" cy="94.0" r="4" fill="var(--s0)" stroke="var(--surface)" stroke-width="2"><title>агент · шаг 6000: 48.0%</title></circle>
-<circle cx="670.0" cy="69.0" r="4" fill="var(--s0)" stroke="var(--surface)" stroke-width="2"><title>агент · шаг 8000: 54.0%</title></circle>
-<path d="M209.5,260.7 L363.0,255.2 L516.5,246.9 L670.0,241.1" fill="none" stroke="var(--s1)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
-<circle cx="209.5" cy="260.7" r="4" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>грамматика · шаг 2000: 8.0%</title></circle>
-<circle cx="363.0" cy="255.2" r="4" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>грамматика · шаг 4000: 9.3%</title></circle>
-<circle cx="516.5" cy="246.9" r="4" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>грамматика · шаг 6000: 11.3%</title></circle>
-<circle cx="670.0" cy="241.1" r="4" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>грамматика · шаг 8000: 12.7%</title></circle>
-<line x1="675.0" y1="69.0" x2="682.0" y2="69.0" stroke="var(--axis)" stroke-width="1"/>
-<circle cx="689" cy="69.0" r="4" fill="var(--s0)"/>
-<text class="l" x="698" y="73.0">агент · 54.0%</text>
-<line x1="675.0" y1="241.1" x2="682.0" y2="241.1" stroke="var(--axis)" stroke-width="1"/>
-<circle cx="689" cy="241.1" r="4" fill="var(--s1)"/>
-<text class="l" x="698" y="245.1">грамматика · 12.7%</text>
+<path d="M192.4,219.0 L328.9,178.4 L465.3,144.0 L601.8,125.2 L670.0,101.8" fill="none" stroke="var(--s0)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="192.4" cy="219.0" r="4" fill="var(--s0)" stroke="var(--surface)" stroke-width="2"><title>агент · шаг 2000: 24.0%</title></circle>
+<circle cx="328.9" cy="178.4" r="4" fill="var(--s0)" stroke="var(--surface)" stroke-width="2"><title>агент · шаг 4000: 37.0%</title></circle>
+<circle cx="465.3" cy="144.0" r="4" fill="var(--s0)" stroke="var(--surface)" stroke-width="2"><title>агент · шаг 6000: 48.0%</title></circle>
+<circle cx="601.8" cy="125.2" r="4" fill="var(--s0)" stroke="var(--surface)" stroke-width="2"><title>агент · шаг 8000: 54.0%</title></circle>
+<circle cx="670.0" cy="101.8" r="4" fill="var(--s0)" stroke="var(--surface)" stroke-width="2"><title>агент · шаг 9000: 61.5%</title></circle>
+<path d="M192.4,269.0 L328.9,264.9 L465.3,258.7 L601.8,254.3 L670.0,240.9" fill="none" stroke="var(--s1)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="192.4" cy="269.0" r="4" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>грамматика · шаг 2000: 8.0%</title></circle>
+<circle cx="328.9" cy="264.9" r="4" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>грамматика · шаг 4000: 9.3%</title></circle>
+<circle cx="465.3" cy="258.7" r="4" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>грамматика · шаг 6000: 11.3%</title></circle>
+<circle cx="601.8" cy="254.3" r="4" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>грамматика · шаг 8000: 12.7%</title></circle>
+<circle cx="670.0" cy="240.9" r="4" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>грамматика · шаг 9000: 17.0%</title></circle>
+<line x1="675.0" y1="101.8" x2="682.0" y2="101.8" stroke="var(--axis)" stroke-width="1"/>
+<circle cx="689" cy="101.8" r="4" fill="var(--s0)"/>
+<text class="l" x="698" y="105.8">агент · 61.5%</text>
+<line x1="675.0" y1="240.9" x2="682.0" y2="240.9" stroke="var(--axis)" stroke-width="1"/>
+<circle cx="689" cy="240.9" r="4" fill="var(--s1)"/>
+<text class="l" x="698" y="244.9">грамматика · 17.0%</text>
 <text class="t" x="56" y="354">Единая модель: потери на токен на отложенных диалогах и грамматических вопросах, нат</text>
 <line class="a" x1="56" x2="670" y1="624.0" y2="624.0"/>
 <text x="48" y="628.0" text-anchor="end">0</text>
@@ -54,37 +57,40 @@ text{fill:var(--ink2);font-size:12px}.t{fill:var(--ink);font-size:14px;font-weig
 <line class="g" x1="56" x2="670" y1="374.0" y2="374.0"/>
 <text x="48" y="378.0" text-anchor="end">5</text>
 <text x="56.0" y="642" text-anchor="middle">0</text>
-<text x="132.8" y="642" text-anchor="middle">1000</text>
-<text x="209.5" y="642" text-anchor="middle">2000</text>
-<text x="286.2" y="642" text-anchor="middle">3000</text>
-<text x="363.0" y="642" text-anchor="middle">4000</text>
-<text x="439.8" y="642" text-anchor="middle">5000</text>
-<text x="516.5" y="642" text-anchor="middle">6000</text>
-<text x="593.2" y="642" text-anchor="middle">7000</text>
-<text x="670.0" y="642" text-anchor="middle">8000</text>
+<text x="124.2" y="642" text-anchor="middle">1000</text>
+<text x="192.4" y="642" text-anchor="middle">2000</text>
+<text x="260.7" y="642" text-anchor="middle">3000</text>
+<text x="328.9" y="642" text-anchor="middle">4000</text>
+<text x="397.1" y="642" text-anchor="middle">5000</text>
+<text x="465.3" y="642" text-anchor="middle">6000</text>
+<text x="533.6" y="642" text-anchor="middle">7000</text>
+<text x="601.8" y="642" text-anchor="middle">8000</text>
+<text x="670.0" y="642" text-anchor="middle">9000</text>
 <text x="670" y="656" text-anchor="end">шаг обучения</text>
-<path d="M132.8,413.5 L209.5,424.0 L286.2,428.5 L363.0,432.5 L439.8,437.5 L516.5,442.0 L593.2,445.0 L670.0,448.0" fill="none" stroke="var(--s2)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
-<circle cx="132.8" cy="413.5" r="4" fill="var(--s2)" stroke="var(--surface)" stroke-width="2"><title>диалоги · шаг 1000: 4.2%</title></circle>
-<circle cx="209.5" cy="424.0" r="4" fill="var(--s2)" stroke="var(--surface)" stroke-width="2"><title>диалоги · шаг 2000: 4.0%</title></circle>
-<circle cx="286.2" cy="428.5" r="4" fill="var(--s2)" stroke="var(--surface)" stroke-width="2"><title>диалоги · шаг 3000: 3.9%</title></circle>
-<circle cx="363.0" cy="432.5" r="4" fill="var(--s2)" stroke="var(--surface)" stroke-width="2"><title>диалоги · шаг 4000: 3.8%</title></circle>
-<circle cx="439.8" cy="437.5" r="4" fill="var(--s2)" stroke="var(--surface)" stroke-width="2"><title>диалоги · шаг 5000: 3.7%</title></circle>
-<circle cx="516.5" cy="442.0" r="4" fill="var(--s2)" stroke="var(--surface)" stroke-width="2"><title>диалоги · шаг 6000: 3.6%</title></circle>
-<circle cx="593.2" cy="445.0" r="4" fill="var(--s2)" stroke="var(--surface)" stroke-width="2"><title>диалоги · шаг 7000: 3.6%</title></circle>
-<circle cx="670.0" cy="448.0" r="4" fill="var(--s2)" stroke="var(--surface)" stroke-width="2"><title>диалоги · шаг 8000: 3.5%</title></circle>
-<path d="M132.8,461.0 L209.5,484.0 L286.2,497.5 L363.0,505.5 L439.8,489.0 L516.5,503.5 L593.2,512.0 L670.0,517.5" fill="none" stroke="var(--s1)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
-<circle cx="132.8" cy="461.0" r="4" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>грамматика · шаг 1000: 3.3%</title></circle>
-<circle cx="209.5" cy="484.0" r="4" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>грамматика · шаг 2000: 2.8%</title></circle>
-<circle cx="286.2" cy="497.5" r="4" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>грамматика · шаг 3000: 2.5%</title></circle>
-<circle cx="363.0" cy="505.5" r="4" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>грамматика · шаг 4000: 2.4%</title></circle>
-<circle cx="439.8" cy="489.0" r="4" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>грамматика · шаг 5000: 2.7%</title></circle>
-<circle cx="516.5" cy="503.5" r="4" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>грамматика · шаг 6000: 2.4%</title></circle>
-<circle cx="593.2" cy="512.0" r="4" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>грамматика · шаг 7000: 2.2%</title></circle>
-<circle cx="670.0" cy="517.5" r="4" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>грамматика · шаг 8000: 2.1%</title></circle>
-<line x1="675.0" y1="448.0" x2="682.0" y2="448.0" stroke="var(--axis)" stroke-width="1"/>
-<circle cx="689" cy="448.0" r="4" fill="var(--s2)"/>
-<text class="l" x="698" y="452.0">диалоги · 3.5%</text>
-<line x1="675.0" y1="517.5" x2="682.0" y2="517.5" stroke="var(--axis)" stroke-width="1"/>
-<circle cx="689" cy="517.5" r="4" fill="var(--s1)"/>
-<text class="l" x="698" y="521.5">грамматика · 2.1%</text>
+<path d="M124.2,413.5 L192.4,424.0 L260.7,428.5 L328.9,432.5 L397.1,437.5 L465.3,442.0 L533.6,445.0 L601.8,448.0 L670.0,449.0" fill="none" stroke="var(--s2)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="124.2" cy="413.5" r="4" fill="var(--s2)" stroke="var(--surface)" stroke-width="2"><title>диалоги · шаг 1000: 4.2%</title></circle>
+<circle cx="192.4" cy="424.0" r="4" fill="var(--s2)" stroke="var(--surface)" stroke-width="2"><title>диалоги · шаг 2000: 4.0%</title></circle>
+<circle cx="260.7" cy="428.5" r="4" fill="var(--s2)" stroke="var(--surface)" stroke-width="2"><title>диалоги · шаг 3000: 3.9%</title></circle>
+<circle cx="328.9" cy="432.5" r="4" fill="var(--s2)" stroke="var(--surface)" stroke-width="2"><title>диалоги · шаг 4000: 3.8%</title></circle>
+<circle cx="397.1" cy="437.5" r="4" fill="var(--s2)" stroke="var(--surface)" stroke-width="2"><title>диалоги · шаг 5000: 3.7%</title></circle>
+<circle cx="465.3" cy="442.0" r="4" fill="var(--s2)" stroke="var(--surface)" stroke-width="2"><title>диалоги · шаг 6000: 3.6%</title></circle>
+<circle cx="533.6" cy="445.0" r="4" fill="var(--s2)" stroke="var(--surface)" stroke-width="2"><title>диалоги · шаг 7000: 3.6%</title></circle>
+<circle cx="601.8" cy="448.0" r="4" fill="var(--s2)" stroke="var(--surface)" stroke-width="2"><title>диалоги · шаг 8000: 3.5%</title></circle>
+<circle cx="670.0" cy="449.0" r="4" fill="var(--s2)" stroke="var(--surface)" stroke-width="2"><title>диалоги · шаг 9000: 3.5%</title></circle>
+<path d="M124.2,461.0 L192.4,484.0 L260.7,497.5 L328.9,505.5 L397.1,489.0 L465.3,503.5 L533.6,512.0 L601.8,517.5 L670.0,520.0" fill="none" stroke="var(--s1)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="124.2" cy="461.0" r="4" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>грамматика · шаг 1000: 3.3%</title></circle>
+<circle cx="192.4" cy="484.0" r="4" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>грамматика · шаг 2000: 2.8%</title></circle>
+<circle cx="260.7" cy="497.5" r="4" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>грамматика · шаг 3000: 2.5%</title></circle>
+<circle cx="328.9" cy="505.5" r="4" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>грамматика · шаг 4000: 2.4%</title></circle>
+<circle cx="397.1" cy="489.0" r="4" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>грамматика · шаг 5000: 2.7%</title></circle>
+<circle cx="465.3" cy="503.5" r="4" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>грамматика · шаг 6000: 2.4%</title></circle>
+<circle cx="533.6" cy="512.0" r="4" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>грамматика · шаг 7000: 2.2%</title></circle>
+<circle cx="601.8" cy="517.5" r="4" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>грамматика · шаг 8000: 2.1%</title></circle>
+<circle cx="670.0" cy="520.0" r="4" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"><title>грамматика · шаг 9000: 2.1%</title></circle>
+<line x1="675.0" y1="449.0" x2="682.0" y2="449.0" stroke="var(--axis)" stroke-width="1"/>
+<circle cx="689" cy="449.0" r="4" fill="var(--s2)"/>
+<text class="l" x="698" y="453.0">диалоги · 3.5%</text>
+<line x1="675.0" y1="520.0" x2="682.0" y2="520.0" stroke="var(--axis)" stroke-width="1"/>
+<circle cx="689" cy="520.0" r="4" fill="var(--s1)"/>
+<text class="l" x="698" y="524.0">грамматика · 2.1%</text>
 </svg>

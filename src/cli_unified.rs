@@ -163,6 +163,7 @@ pub fn cmd_chat(a: &Args) -> Result<()> {
     a2.opts.entry("temperature".into()).or_insert_with(|| "0.7".into());
     a2.opts.entry("repeat-penalty".into()).or_insert_with(|| "1.5".into());
     let mut policy = UnifiedPolicy::new(load_engine(&a2, &ckpt)?);
+    let layout = policy.engine.model.cfg.layout;
     if a.opts.contains_key("think") {
         policy = policy.with_trace();
     }
@@ -231,8 +232,14 @@ pub fn cmd_chat(a: &Args) -> Result<()> {
             None => "",
         };
         println!("Агент  : {reply}{check}   ({} шаг., {:.1} с)", ep.steps.len(), t0.elapsed().as_secs_f64());
-        history.push(Turn::user(line));
-        history.push(Turn::bot(reply));
+        // a line without an answer stays out of the conversation (the model never saw «…»); a
+        // first-format model learned its history from dialogues only, so it keeps the lines it
+        // answered directly (conversation), not its browsing and calculations
+        let chatted = ep.steps.len() == 1 || layout.scratchpad;
+        if ep.answer.is_some() && chatted {
+            history.push(Turn::user(line));
+            history.push(Turn::bot(reply));
+        }
     }
     Ok(())
 }

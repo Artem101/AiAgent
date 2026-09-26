@@ -342,6 +342,23 @@ impl Spec {
         }
     }
 
+    /// The teacher's final answer in words (for a filter: the first match in catalogue order;
+    /// for a phrase: its canonical reply).
+    pub fn answer_sentence(&self, world: &World) -> String {
+        match *self {
+            Self::Lookup { item, attr } => say::lookup(item, attr, &world.display(item, attr)),
+            Self::Compare { a, b, attr, most } => say::compare(Self::winner(world, a, b, attr, most), attr, most),
+            Self::Filter(cond) => world
+                .catalog
+                .iter()
+                .find(|&&i| cond.holds(world, i))
+                .map_or_else(|| "Не нашёл такого товара.".to_string(), |&i| say::filter(i)),
+            Self::Calc { .. } => say::calc(&self.calc_expr(world).expect("has an expression"), &self.expected(world)),
+            Self::Total { kind, .. } => say::total(kind, &self.expected(world)),
+            Self::Chat(c) => c.reply().to_string(),
+        }
+    }
+
     /// The canonical answer (for a filter: the first match in catalogue order).
     pub fn expected(&self, world: &World) -> String {
         match *self {
@@ -1128,6 +1145,8 @@ mod tests {
                     assert!(!g.text.contains('{'), "{}", g.text);
                     let expected = spec.expected(&world);
                     assert!(spec.accepts(&world, &expected), "{} → {expected}", g.text);
+                    let said = spec.answer_sentence(&world);
+                    assert!(spec.accepts(&world, &said), "{} → {said}", g.text);
                     match spec {
                         // the free-form parser recovers the expression, not the wording
                         Spec::Calc { expr, .. } => match recognize(&g.text) {
