@@ -1,9 +1,12 @@
 //! Open-vocabulary text: a byte-level BPE tokenizer ([`bpe`]) trained on Russian text, the
 //! shared special tokens, and a text corpus for next-chunk prediction (`--task text`).
 //!
-//! The shipped tokenizer (`models/tokenizer_ru.bpe`, [`ru`]) has 18 special tokens, 256 byte
-//! tokens and 750 merges learned on the UD Russian corpus plus the browsing task's texts — 1024
-//! tokens in total. Thanks to byte fallback any text, in any language, can be encoded.
+//! The shipped tokenizer (`models/tokenizer_ru.bpe`, [`ru`]) has 20 special tokens, 256 byte
+//! tokens and 7916 merges learned on the «ru20k» dataset (dialogues, example sentences for the
+//! 20 000 most frequent words, grammar questions — see `scripts/build_ru20k.py`), the UD Russian
+//! corpus and the browsing task's texts — 8192 tokens in total. Thanks to byte fallback any
+//! text, in any language, can be encoded. (The first agent used a 1024-token tokenizer trained
+//! on UD Russian alone; it and that agent's checkpoint are in the repository history.)
 //!
 //! Every text fragment — a sentence, an instruction, a page element, the text of an action — is
 //! encoded with a leading space ([`fragment`]). A word or a number is then the same tokens
@@ -22,9 +25,9 @@ pub use bpe::Bpe;
 use crate::kernels::rng::Rng;
 
 /// Special tokens (ids `0..SPECIALS.len()`), shared by every task that uses [`ru`].
-pub const SPECIALS: [&str; 18] = [
+pub const SPECIALS: [&str; 20] = [
     "<pad>", "<goal>", "<end>", "<none>", "<empty>", "<text>", "[head]", "[link]", "[input]", "[button]", "[label]",
-    "[value]", "[text]", "CLICK", "TYPE", "BACK", "ANSWER", "CALC",
+    "[value]", "[text]", "CLICK", "TYPE", "BACK", "ANSWER", "CALC", "<user>", "<bot>",
 ];
 
 pub const PAD: u32 = 0;
@@ -43,6 +46,10 @@ pub const BACK: u32 = 15;
 pub const ANSWER: u32 = 16;
 /// Calculator call (an action) and its result (in the next observation).
 pub const CALC: u32 = 17;
+/// Earlier turns of a conversation in an observation: what the user said…
+pub const USER: u32 = 18;
+/// …and what the agent answered. Also the first input of the speech decoder.
+pub const BOT: u32 = 19;
 
 static RU: OnceLock<Bpe> = OnceLock::new();
 
@@ -195,7 +202,7 @@ mod tests {
     #[test]
     fn shipped_tokenizer_round_trips_russian() {
         let bpe = ru();
-        assert_eq!(bpe.vocab_size(), 1024);
+        assert_eq!(bpe.vocab_size(), 8192);
         for (i, s) in SPECIALS.iter().enumerate() {
             assert_eq!(bpe.special(s), Some(i as u32));
         }

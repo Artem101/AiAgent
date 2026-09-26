@@ -1,23 +1,23 @@
 //! Scripted teacher: the next action from the page snapshot and the structured goal.
 //!
 //! ```text
-//! lookup  product page of the item          → ANSWER <value of the attribute row>
+//! lookup  product page of the item          → ANSWER «Лампа стоит 12 ₽.» (the attribute row, in a sentence)
 //!         value visible in a results / catalogue row → ANSWER it (price, rating / price, color)
 //!         item among the links              → CLICK [link] <item>
 //!         search box holds the item         → CLICK [button] Найти
 //!         a search box                      → TYPE <item>
-//! compare both products listed with values  → ANSWER <the cheaper / pricier / better / worse>
+//! compare both products listed with values  → ANSWER «Стул дешевле.» (cheaper / pricier / better / worse)
 //!         search box holds «a b»            → CLICK [button] Найти
 //!         a search box                      → TYPE «a b»
-//! filter  a catalogue row matches           → ANSWER <product>
+//! filter  a catalogue row matches           → ANSWER «Например, стул.»
 //!         otherwise                         → CLICK [link] Далее (last page: Главная, start over)
 //!         search page                       → CLICK [link] Каталог
-//! calc    the tool result is for the expression → ANSWER <result>
+//! calc    the tool result is for the expression → ANSWER «12 * 3 = 36» (the calculator's line)
 //!         otherwise                         → CALC <expression as written in the question>
-//! total   both prices listed, result known  → ANSWER <result>
+//! total   both prices listed, result known  → ANSWER «Вместе 19 ₽.» / «Лампа дороже на 5 ₽.»
 //!         both prices listed                → CALC «price a + price b» (or the difference)
 //!         otherwise                         → search «a b», as for compare
-//! chat                                      → ANSWER <the fixed reply>
+//! chat                                      → ANSWER <the canonical reply> (training data: any of the replies)
 //! any     wrong product page                → BACK
 //!         page of another task              → CLICK [link] Главная
 //!         no way forward                    → BACK
@@ -27,7 +27,7 @@
 //! navigation), which is what the training states in [`super::data`] cover.
 
 use super::action::Action;
-use super::goal::{CalcForm, Cond, Spec};
+use super::goal::{say, CalcForm, Cond, Spec};
 use super::obs::Note;
 use super::world::{
     item_index, parse_number, Attr, COLORS, ITEMS, UI_CATALOG, UI_FIND, UI_HOME, UI_NEXT, UI_RESULTS, UI_SEARCH,
@@ -116,14 +116,6 @@ fn answer(text: impl Into<String>) -> Action {
     Action::Answer { text: text.into() }
 }
 
-/// Answer text for a displayed value (`"12 ₽"` → `"12"`).
-fn answer_value(attr: Attr, shown: &str) -> Action {
-    match attr {
-        Attr::Price | Attr::Rating => answer(parse_number(shown).map_or(shown.to_string(), |n| n.to_string())),
-        _ => answer(shown),
-    }
-}
-
 /// Search for `query`: submit if it is already typed, type it otherwise.
 fn search(view: &View, query: &str) -> Action {
     match view.input {
@@ -151,10 +143,10 @@ fn column(kind: PageKind, attr: Attr) -> Option<usize> {
     }
 }
 
-/// `ANSWER` with the result when `note` is for `expr`, `CALC expr` otherwise.
-fn calculate(expr: String, note: Option<&Note>) -> Action {
+/// `ANSWER` with the result (worded by `say`) when `note` is for `expr`, `CALC expr` otherwise.
+fn calculate(expr: String, note: Option<&Note>, say: impl FnOnce(&Note) -> String) -> Action {
     match note {
-        Some(n) if n.is_for(&expr) => answer(n.result.clone()),
+        Some(n) if n.is_for(&expr) => answer(say(n)),
         _ => Action::Calc { text: expr },
     }
 }
@@ -163,7 +155,9 @@ fn calculate(expr: String, note: Option<&Note>) -> Action {
 pub fn act(spec: &Spec, snap: &PageSnapshot, note: Option<&Note>) -> Action {
     let view = View::of(snap);
     match *spec {
-        Spec::Calc { expr, form } => calculate(expr.text(form != CalcForm::Compact), note),
+        Spec::Calc { expr, form } => {
+            calculate(expr.text(form != CalcForm::Compact), note, |n| say::calc(&n.expr, &n.result))
+        }
         Spec::Chat(c) => answer(c.reply()),
         Spec::Total { a, b, kind } => {
             let query = format!("{} {}", ITEMS[a].nom, ITEMS[b].nom);
@@ -171,7 +165,9 @@ pub fn act(spec: &Spec, snap: &PageSnapshot, note: Option<&Note>) -> Action {
                 PageKind::Results => {
                     let price = |i: usize| view.row(i).and_then(|v| v.first().copied()).and_then(parse_number);
                     match (price(a), price(b)) {
-                        (Some(x), Some(y)) => calculate(Spec::total_expr(kind, x, y), note),
+                        (Some(x), Some(y)) => {
+                            calculate(Spec::total_expr(kind, x, y), note, |n| say::total(kind, a, &n.result))
+                        }
                         _ => search(&view, &query),
                     }
                 }
@@ -183,12 +179,14 @@ pub fn act(spec: &Spec, snap: &PageSnapshot, note: Option<&Note>) -> Action {
         Spec::Lookup { item, attr } => {
             let name = ITEMS[item].nom;
             match view.kind {
-                PageKind::Item(i) if i == item => {
-                    view.table.iter().find(|(a, _)| *a == attr).map_or(Action::Back, |(_, v)| answer_value(attr, v))
-                }
+                PageKind::Item(i) if i == item => view
+                    .table
+                    .iter()
+                    .find(|(a, _)| *a == attr)
+                    .map_or(Action::Back, |(_, v)| answer(say::lookup(item, attr, v))),
                 PageKind::Item(_) => Action::Back,
                 PageKind::Results | PageKind::Catalog => match (view.row(item), column(view.kind, attr)) {
-                    (Some(vals), Some(c)) if c < vals.len() => answer_value(attr, vals[c]),
+                    (Some(vals), Some(c)) if c < vals.len() => answer(say::lookup(item, attr, vals[c])),
                     (Some(_), _) => click(Role::Link, name),
                     _ if view.kind == PageKind::Results => search(&view, name),
                     _ => leave(&view),
@@ -205,7 +203,7 @@ pub fn act(spec: &Spec, snap: &PageSnapshot, note: Option<&Note>) -> Action {
                         view.row(i).and_then(|v| column(PageKind::Results, attr).and_then(|c| v.get(c)).copied())
                     };
                     match (val(a).and_then(parse_number), val(b).and_then(parse_number)) {
-                        (Some(x), Some(y)) => answer(ITEMS[if (x > y) == most { a } else { b }].nom),
+                        (Some(x), Some(y)) => answer(say::compare(if (x > y) == most { a } else { b }, attr, most)),
                         _ => search(&view, &query),
                     }
                 }
@@ -222,7 +220,7 @@ pub fn act(spec: &Spec, snap: &PageSnapshot, note: Option<&Note>) -> Action {
                     Cond::Color(c) => vals.get(1) == Some(&COLORS[c].0),
                 };
                 match view.rows.iter().find(|(_, v)| ok(v)) {
-                    Some((i, _)) => answer(ITEMS[*i].nom),
+                    Some((i, _)) => answer(say::filter(*i)),
                     None if view.has_link(UI_NEXT) => click(Role::Link, UI_NEXT),
                     None => leave(&view), // last page: start over from the first
                 }

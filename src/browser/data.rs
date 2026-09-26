@@ -246,7 +246,11 @@ pub fn raw(rng: &mut Rng, split: Split) -> (Goal, PageSnapshot, Option<Note>, Ac
     let (path, typed) = state(rng, &world, &spec);
     let snapshot = snapshot(&path, typed);
     let note = note(rng, &world, &spec);
-    let action = expert::act(&spec, &snapshot, note.as_ref());
+    let action = match spec {
+        // the teacher's replies vary
+        Spec::Chat(c) => Action::Answer { text: c.replies()[rng.below(c.replies().len())].to_string() },
+        _ => expert::act(&spec, &snapshot, note.as_ref()),
+    };
     (goal, snapshot, note, action)
 }
 
@@ -301,8 +305,9 @@ mod tests {
         assert!(max_goal < obs::GOAL_MAX, "instruction of {max_goal} tokens is truncated");
         assert!(max_note < NOTE_MAX, "tool result of {max_note} tokens is truncated");
         assert!(
-            max_page + max_goal + max_note <= OBS_LEN,
-            "page {max_page} + goal {max_goal} + tool {max_note} > {OBS_LEN}"
+            max_page + max_goal + max_note + obs::HISTORY_MAX <= OBS_LEN,
+            "page {max_page} + goal {max_goal} + tool {max_note} + history {} > {OBS_LEN}",
+            obs::HISTORY_MAX
         );
     }
 }

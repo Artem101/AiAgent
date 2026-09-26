@@ -1,51 +1,42 @@
-//! Browsing agent from code: load (or briefly train) a browser checkpoint, then let the engine
-//! answer a Russian question by searching the sandbox web in headless Chromium (or the
-//! simulator when no Chromium is installed), printing its latent reasoning at every step and
-//! every call of the calculator tool.
+//! The agent from code: load (or briefly train) a unified checkpoint, then talk to it. Every line
+//! is one episode in the sandbox web — headless Chromium, or the simulator when no Chromium is
+//! installed — where the model may search, calculate or just answer; the conversation so far is
+//! part of what it sees. Its latent reasoning and every calculator call are printed.
 //!
 //! ```text
-//! cargo run --release --example browser_agent -- [checkpoint] ["вопрос"]
-//! cargo run --release --example browser_agent -- models/browser_agent.safetensors "Что дешевле: лампа или стул?"
-//! cargo run --release --example browser_agent -- models/browser_agent.safetensors "Сколько будет 5+5?"
+//! cargo run --release --example browser_agent -- [checkpoint] ["реплика|реплика|…"]
+//! cargo run --release --example browser_agent -- models/agent.safetensors "Привет!|Сколько стоит лампа?|Спасибо!"
+//! cargo run --release --example browser_agent -- models/agent.safetensors "Сколько будет 5+5?"
 //! ```
 
 use candle_core::{Device, Result};
-use cog_engine::browser::agent::{self, EnginePolicy};
+use cog_engine::browser::agent;
 use cog_engine::browser::goal::{self, Goal};
+use cog_engine::browser::obs::Turn;
 use cog_engine::browser::sim::SIM_ORIGIN;
-use cog_engine::browser::{self, Browser, Chrome, SimBrowser, SiteServer};
-use cog_engine::data::Task;
-use cog_engine::train::Trainer;
-use cog_engine::{CogModel, CognitiveEngine, TrainConfig};
+use cog_engine::browser::{Browser, Chrome, SimBrowser, SiteServer};
+use cog_engine::dialog::LanguageData;
+use cog_engine::unified::{
+    UnifiedConfig, UnifiedEngine, UnifiedModel, UnifiedPolicy, UnifiedTrainConfig, UnifiedTrainer,
+};
 
 fn main() -> Result<()> {
     let ckpt = std::env::args().nth(1);
-    let question = std::env::args().nth(2).unwrap_or_else(|| "Сколько стоит лампа?".into());
+    let lines = std::env::args().nth(2).unwrap_or_else(|| "Привет!|Сколько стоит лампа?|Спасибо!".into());
 
-    // The architecture of a checkpoint is recorded next to it (`<ckpt>.cfg`, written by the CLI).
-    let meta = ckpt.as_ref().and_then(|p| std::fs::read_to_string(format!("{p}.cfg")).ok()).unwrap_or_default();
-    let field = |k: &str| meta.lines().find_map(|l| l.strip_prefix(&format!("{k}=")).map(str::to_string));
-    let mut cfg = browser::engine_config(&field("preset").unwrap_or_else(|| "tiny".into()))?;
-    if let Some(copy) = field("copy").and_then(|c| c.parse().ok()) {
-        cfg.jepa.copy_dim = copy;
-    }
-    let model = CogModel::new(cfg, &Device::Cpu)?;
+    // The architecture of a checkpoint is recorded next to it (`<ckpt>.cfg`).
     let model = match ckpt {
-        Some(path) => {
-            model.load(&path)?;
-            model
-        }
+        Some(path) => UnifiedModel::load(&path, &Device::Cpu)?,
         None => {
-            println!("no checkpoint given: training for 300 steps (the agent will be weak)");
-            let mut tc = TrainConfig::quick(Task::Browser);
-            tc.steps = 300;
-            tc.eval_every = 0;
-            let mut trainer = Trainer::new(model, tc)?;
-            trainer.run(|line| println!("{line}"))?;
+            println!("no checkpoint given: training a tiny model for 200 steps on built-in data (it will be weak)");
+            let model = UnifiedModel::new(UnifiedConfig::preset("tiny")?, &Device::Cpu)?;
+            let tc = UnifiedTrainConfig { steps: 200, batch_size: 16, log_every: 50, ..Default::default() };
+            let mut trainer = UnifiedTrainer::new(model, tc, LanguageData::builtin())?;
+            trainer.run_until(200, |line| println!("{line}"))?;
             trainer.model
         }
     };
-    let mut policy = EnginePolicy::new(CognitiveEngine::from_model(&model)?).with_trace();
+    let mut policy = UnifiedPolicy::new(UnifiedEngine::new(model)?).with_trace();
 
     // Real Chromium if available, otherwise the DOM-identical simulator.
     let server = SiteServer::start("127.0.0.1:0")?;
@@ -53,26 +44,40 @@ fn main() -> Result<()> {
         Some(_) => (Box::new(Chrome::launch_default()?), server.origin()),
         None => (Box::new(SimBrowser::new()), SIM_ORIGIN.to_string()),
     };
-
-    // The model reads the raw text; the recognised spec is only used to check the answer.
-    let goal = Goal { spec: goal::recognize(&question), text: question.clone() };
-    println!("\n{question}");
     // `CALC` actions go to a sandboxed python3 (or its exact Rust mirror without Python).
     let mut calc = cog_engine::tools::default_calculator();
-    let ep = agent::run_episode(browser.as_mut(), &mut policy, calc.as_mut(), &origin, 42, &goal, 12, |s| {
-        let action = s.action.as_ref().map_or("?".into(), |a| a.to_string());
-        println!("  {:<56} {action}", s.url);
-        if let Some((note, by)) = &s.tool {
-            println!("      {by}: {} = {}", note.expr, note.result);
+    let mut history: Vec<Turn> = Vec::new();
+    for line in lines.split('|').map(str::trim).filter(|l| !l.is_empty()) {
+        // The model reads the raw text; the recognised spec is only used to check the answer.
+        let goal = Goal { spec: goal::recognize(line), text: line.to_string() };
+        println!("\n> {line}");
+        let ep = agent::run_dialog_episode(
+            browser.as_mut(),
+            &mut policy,
+            calc.as_mut(),
+            &origin,
+            42,
+            &history,
+            &goal,
+            12,
+            |s| {
+                let action = s.action.as_ref().map_or("?".into(), |a| a.to_string());
+                println!("  {:<48} {action}", s.url);
+                if let Some((note, by)) = &s.tool {
+                    println!("      {by}: {} = {}", note.expr, note.result);
+                }
+                if let Some(r) = &s.thoughts {
+                    println!("      {}", r.stats);
+                }
+            },
+        )?;
+        let answer = ep.answer.clone().unwrap_or_else(|| "…".into());
+        match ep.success() {
+            Some(ok) => println!("< {answer} ({})", if ok { "correct" } else { "wrong" }),
+            None => println!("< {answer}"),
         }
-        if let Some(r) = &s.thoughts {
-            println!("      {}", r.stats);
-        }
-    })?;
-    match (&ep.answer, ep.success()) {
-        (Some(a), Some(ok)) => println!("answer: {a} ({})", if ok { "correct" } else { "wrong" }),
-        (Some(a), None) => println!("answer: {a}"),
-        (None, _) => println!("no answer within 12 steps"),
+        history.push(Turn::user(line));
+        history.push(Turn::bot(answer));
     }
     Ok(())
 }

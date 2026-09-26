@@ -202,12 +202,51 @@ pub fn modulate(x: &Tensor, shift: &Tensor, scale: &Tensor) -> Result<Tensor> {
 
 /// Multi-head attention, `q: [B, Lq, d]`, `k, v: [B, Lk, d]` → `[B, Lq, d]`.
 pub fn mha(q: &Tensor, k: &Tensor, v: &Tensor, heads: usize) -> Result<Tensor> {
+    mha_masked(q, k, v, heads, None)
+}
+
+/// Additive mask value that removes a key from the softmax.
+pub const MASKED: f32 = -1e9;
+
+/// Causal self-attention mask `[1, 1, l, l]`: query `i` sees keys `0..=i`.
+pub fn causal_mask(l: usize, device: &Device) -> Result<Tensor> {
+    let m: Vec<f32> = (0..l * l).map(|i| if i % l > i / l { MASKED } else { 0.0 }).collect();
+    Tensor::from_vec(m, (1, 1, l, l), device)
+}
+
+/// Splits `[B, L, d]` into heads: `[B, heads, L, d / heads]` (contiguous).
+pub fn split_heads(t: &Tensor, heads: usize) -> Result<Tensor> {
+    let (b, l, d) = t.dims3()?;
+    t.reshape((b, l, heads, d / heads))?.transpose(1, 2)?.contiguous()
+}
+
+/// Attention of `q: [B, Lq, d]` over keys and values already split into heads
+/// (`[B, heads, Lk, d / heads]`, see [`split_heads`]) → `[B, Lq, d]`; `mask` as in [`mha_masked`].
+pub fn attend(q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
+    let (b, heads, _, dh) = k.dims4()?;
+    let lq = q.dims()[1];
+    let q = split_heads(q, heads)?;
+    let mut scores = (q.matmul(&k.t()?)? * (1.0 / (dh as f64).sqrt()))?;
+    if let Some(m) = mask {
+        scores = scores.broadcast_add(&m.to_dtype(scores.dtype())?)?;
+    }
+    let dt = scores.dtype();
+    let p = candle_nn::ops::softmax(&scores.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(dt)?;
+    p.matmul(v)?.transpose(1, 2)?.reshape((b, lq, heads * dh))
+}
+
+/// [`mha`] with an additive `mask` broadcastable to `[B, heads, Lq, Lk]` (`0` keeps a key,
+/// [`MASKED`] drops it; every query must keep at least one key).
+pub fn mha_masked(q: &Tensor, k: &Tensor, v: &Tensor, heads: usize, mask: Option<&Tensor>) -> Result<Tensor> {
     let (b, lq, d) = q.dims3()?;
     let lk = k.dims()[1];
     let dh = d / heads;
     let split = |t: &Tensor, l: usize| t.reshape((b, l, heads, dh))?.transpose(1, 2)?.contiguous();
     let (q, k, v) = (split(q, lq)?, split(k, lk)?, split(v, lk)?);
-    let scores = (q.matmul(&k.t()?.contiguous()?)? * (1.0 / (dh as f64).sqrt()))?;
+    let mut scores = (q.matmul(&k.t()?.contiguous()?)? * (1.0 / (dh as f64).sqrt()))?;
+    if let Some(m) = mask {
+        scores = scores.broadcast_add(&m.to_dtype(scores.dtype())?)?;
+    }
     let dt = scores.dtype();
     // `softmax_last_dim` is a fused kernel without a backward pass: it would silently cut the
     // gradient to the queries and keys.

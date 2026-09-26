@@ -12,7 +12,7 @@ use super::Role;
 use crate::text::{fragment, Bpe, ANSWER, BACK, CALC, CLICK, END, NONE, PAD, TYPE};
 
 /// Tokens per action (`L`); must be divisible by the planning horizon.
-pub const ACTION_LEN: usize = 16;
+pub const ACTION_LEN: usize = 32;
 /// Longest text an action can carry, in tokens.
 pub const MAX_TEXT: usize = ACTION_LEN - 3;
 
@@ -139,7 +139,9 @@ mod tests {
         assert_eq!(Action::decode(&[ANSWER, NONE, END, PAD], bpe), None);
         assert_eq!(Action::decode(&[TYPE, Role::Input.token(), 300, CLICK, END], bpe), None);
         assert!(Action::Type {
-            text: "очень длинный текст, который никак не помещается в одно действие агента".into()
+            text: "очень длинный текст, который никак не помещается в одно действие агента, потому что в нём \
+                   слишком много слов: даже самый щедрый словарь не уложит его в двадцать девять токенов"
+                .into()
         }
         .encode(bpe)
         .is_none());

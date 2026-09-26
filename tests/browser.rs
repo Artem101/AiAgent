@@ -118,17 +118,17 @@ fn teacher_calculates_with_the_tool() -> Result<()> {
             Ok((actions, seen))
         };
     let (acts, seen) = run(&mut sim, "Сколько будет 5+5?", None)?;
-    assert_eq!(acts, [Action::Calc { text: "5+5".into() }, Action::Answer { text: "10".into() }]);
+    assert_eq!(acts, [Action::Calc { text: "5+5".into() }, Action::Answer { text: "5+5 = 10".into() }]);
     // the result is in the second observation, after the question
     let tail = text::fragment(text::ru(), "5+5 = 10");
     assert!(seen[1].ends_with(&tail), "{}", obs::describe(&seen[1]));
     let (acts, _) = run(&mut sim, "Умножь 12 на 3.", Some(Note::of("12 * 4", &Ok("48".into()))))?;
-    assert_eq!(acts, [Action::Calc { text: "12 * 3".into() }, Action::Answer { text: "36".into() }]);
+    assert_eq!(acts, [Action::Calc { text: "12 * 3".into() }, Action::Answer { text: "12 * 3 = 36".into() }]);
     let (acts, _) = run(&mut sim, "Сколько стоят вместе лампа и стул?", None)?;
     assert_eq!(acts[0], Action::Type { text: "лампа стул".into() });
     assert!(matches!(&acts[2], Action::Calc { text } if text.contains('+')), "{acts:?}");
     let w = cog_engine::browser::World::new(5);
-    assert_eq!(acts[3], Action::Answer { text: (w.price[0] + w.price[1]).to_string() });
+    assert_eq!(acts[3], Action::Answer { text: format!("Вместе {} ₽.", w.price[0] + w.price[1]) });
     Ok(())
 }
 
@@ -145,7 +145,7 @@ fn python_calculator_runs_in_the_episode() -> Result<()> {
     let ep = agent::run_episode(&mut SimBrowser::new(), &mut ExpertPolicy, &mut py, SIM_ORIGIN, 1, &goal, 4, |_| {})?;
     let (note, by) = ep.steps[0].tool.clone().expect("a calculator call");
     assert_eq!((note.expr.as_str(), note.result.as_str(), by.as_str()), ("7 * 8", "56", "python"));
-    assert_eq!(ep.answer.as_deref(), Some("56"));
+    assert_eq!(ep.answer.as_deref(), Some("7 * 8 = 56"));
     assert_eq!(ep.success(), Some(true));
     Ok(())
 }

@@ -49,6 +49,9 @@ pub struct CopyHead {
     pub gate: Lin,
     /// Token ids below this are never copied (special tokens).
     pub min_token: u32,
+    /// Point only at copyable positions (the fresh softmax masks the others) instead of
+    /// dropping the mass that lands on them.
+    pub mask_specials: bool,
 }
 
 /// `log σ(x)`, numerically stable.
@@ -60,10 +63,16 @@ fn log_sigmoid(x: &Tensor) -> Result<Tensor> {
 
 impl CopyHead {
     pub fn new(ps: &mut ParamStore, d_token: usize, d_key: usize, min_token: u32) -> Result<Self> {
+        Self::named(ps, "jepa.copy", d_token, d_key, min_token)
+    }
+
+    /// A copy head with parameters `{prefix}_query`, `{prefix}_gate`.
+    pub fn named(ps: &mut ParamStore, prefix: &str, d_token: usize, d_key: usize, min_token: u32) -> Result<Self> {
         Ok(Self {
-            query: ps.linear("jepa.copy_query", d_token, d_key, false)?,
-            gate: ps.linear("jepa.copy_gate", d_token, 2, true)?,
+            query: ps.linear(&format!("{prefix}_query"), d_token, d_key, false)?,
+            gate: ps.linear(&format!("{prefix}_gate"), d_token, 2, true)?,
             min_token,
+            mask_specials: false,
         })
     }
 
@@ -74,10 +83,20 @@ impl CopyHead {
     /// Pointer distributions `p_l`, `[M, L, N]`, and the copy-gate logits `[M, L]`, for probe
     /// embeddings `emb: [M, L, d_token]` over `keys: [M, N, d_key]`.
     pub fn pointer(&self, emb: &Tensor, keys: &Tensor) -> Result<(Tensor, Tensor)> {
+        self.pointer_over(emb, keys, None)
+    }
+
+    /// [`CopyHead::pointer`]; with `context: [M, N]` (token ids) and `mask_specials`, positions
+    /// holding special tokens get no fresh pointer mass.
+    pub fn pointer_over(&self, emb: &Tensor, keys: &Tensor, context: Option<&Tensor>) -> Result<(Tensor, Tensor)> {
         let (m, l, _) = emb.dims3()?;
         let n = keys.dims()[1];
         let q = self.query.forward(emb)?;
-        let scores = (q.matmul(&keys.transpose(1, 2)?.contiguous()?)? / (self.d_key() as f64).sqrt())?;
+        let mut scores = (q.matmul(&keys.transpose(1, 2)?.contiguous()?)? / (self.d_key() as f64).sqrt())?;
+        if let (true, Some(ctx)) = (self.mask_specials, context) {
+            let special = ctx.lt(self.min_token)?.to_dtype(scores.dtype())?.affine(crate::nn::MASKED as f64, 0.0)?;
+            scores = scores.broadcast_add(&special.unsqueeze(1)?)?;
+        }
         let fresh = candle_nn::ops::softmax(&scores, D::Minus1)?; // not `softmax_last_dim`: no backward
         let gates = self.gate.forward(emb)?; // [M, L, 2]
         let shift = candle_nn::ops::sigmoid(&gates.narrow(2, 0, 1)?)?; // [M, L, 1]
@@ -94,6 +113,38 @@ impl CopyHead {
         Ok((Tensor::stack(&p, 1)?, gates.narrow(2, 1, 1)?.squeeze(2)?))
     }
 
+    /// One slot of [`CopyHead::pointer_over`] (incremental decoding): `emb: [M, 1, d_token]`,
+    /// `prev`: the pointer distribution of the previous slot `[M, N]` (`None` at slot 0).
+    /// Returns the pointer `[M, N]` and the copy-gate logit `[M]`.
+    pub fn pointer_step(
+        &self,
+        emb: &Tensor,
+        keys: &Tensor,
+        context: Option<&Tensor>,
+        prev: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor)> {
+        let m = emb.dims()[0];
+        let n = keys.dims()[1];
+        let q = self.query.forward(emb)?;
+        let mut scores = (q.matmul(&keys.transpose(1, 2)?.contiguous()?)? / (self.d_key() as f64).sqrt())?;
+        if let (true, Some(ctx)) = (self.mask_specials, context) {
+            let special = ctx.lt(self.min_token)?.to_dtype(scores.dtype())?.affine(crate::nn::MASKED as f64, 0.0)?;
+            scores = scores.broadcast_add(&special.unsqueeze(1)?)?;
+        }
+        let fresh = candle_nn::ops::softmax(&scores, D::Minus1)?.squeeze(1)?; // [M, N]
+        let gates = self.gate.forward(emb)?.squeeze(1)?; // [M, 2]
+        let p = match prev {
+            None => fresh,
+            Some(prev) => {
+                let shift = candle_nn::ops::sigmoid(&gates.narrow(1, 0, 1)?)?; // [M, 1]
+                let zero = Tensor::zeros((m, 1), fresh.dtype(), fresh.device())?;
+                let shifted = if n > 1 { Tensor::cat(&[&zero, &prev.narrow(1, 0, n - 1)?], 1)? } else { zero };
+                (shifted.broadcast_mul(&shift)? + fresh.broadcast_mul(&(shift.neg()? + 1.0)?)?)?
+            }
+        };
+        Ok((p, gates.narrow(1, 1, 1)?.squeeze(1)?))
+    }
+
     /// `log P_l(y_l)` of the mixture, `[M, L]`, and the pointer's own loss (a scalar).
     ///
     /// `emb: [M, L, d_token]`, `logits: [M, L, V]` (vocabulary head, f32),
@@ -108,7 +159,7 @@ impl CopyHead {
     ) -> Result<(Tensor, Tensor)> {
         let (m, l, _) = emb.dims3()?;
         let n = context.dims()[1];
-        let (p, copy_logit) = self.pointer(emb, keys)?;
+        let (p, copy_logit) = self.pointer_over(emb, keys, Some(context))?;
         let (p, copy_logit) = (p.to_dtype(DType::F32)?, copy_logit.to_dtype(DType::F32)?);
         // pointer mass on (copyable) positions holding the target token
         let copyable = context.ge(self.min_token)?.to_dtype(DType::F32)?.unsqueeze(1)?; // [M, 1, N]
@@ -133,6 +184,9 @@ impl CopyHead {
     }
 
     pub fn pack(&self, dtype: DType) -> Result<PackedCopyHead> {
+        if self.mask_specials {
+            candle_core::bail!("the packed copy head does not mask specials")
+        }
         Ok(PackedCopyHead { query: self.query.pack(dtype)?, gate: self.gate.pack(dtype)?, min_token: self.min_token })
     }
 }

@@ -118,6 +118,29 @@ impl TttEncoder {
         Ok((readouts, keys))
     }
 
+    /// Readouts after each prefix length in `snapshots`, the per-token features `[x̃_t ; z_t]`
+    /// `[B, n, w·d_model + d_fast]` of the first `n` tokens (causal window and layer output — the
+    /// context memory the speech decoder attends to, see [`crate::speech`]) and their copy keys
+    /// (`None` without a copy mechanism).
+    pub fn encode_with_features(
+        &self,
+        x: &Tensor,
+        snapshots: &[usize],
+        n: usize,
+    ) -> Result<(Vec<Tensor>, Tensor, Option<Tensor>)> {
+        let (snaps, outputs) = self.layer.scan_with_outputs(x, snapshots, self.readout_last, n)?;
+        let readouts = snaps.iter().map(|s| self.readout(s)).collect::<Result<Vec<_>>>()?;
+        let Some((window, z)) = outputs else { bail!("encode_with_features: no context tokens (n = 0)") };
+        let feats = Tensor::cat(&[window, z], 2)?;
+        let keys = self.copy_key.as_ref().map(|k| k.forward(&feats)).transpose()?;
+        Ok((readouts, feats, keys))
+    }
+
+    /// Width of the per-token features of [`TttEncoder::encode_with_features`].
+    pub fn d_features(&self) -> usize {
+        self.layer.wk.d_in() + self.layer.d_fast()
+    }
+
     /// `prompt: [B, N]` → `S_prompt: [B, d_ctx]` (graph path).
     pub fn encode(&self, prompt: &Tensor, dtype: DType) -> Result<Tensor> {
         let n = prompt.dims2()?.1;

@@ -21,7 +21,18 @@
 //! cog_engine agent-eval --ckpt agent.safetensors [--episodes 100] [--browser sim|chrome] [--policy model|expert]
 //!                  [--calc rust|python] [--split train|heldout] [--steps 1000]
 //! cog_engine site  [--addr 127.0.0.1:8080]                  serve the sandbox web for a human browser
+//!
+//! The unified model — one network that browses, calculates and talks (docs/unified.md):
+//! cog_engine train-unified [--preset base|tiny] [--steps 20000] [--batch 32] [--lr 1e-3] [--out models/agent.safetensors]
+//!                  [--data data/ru20k|builtin] [--ud data/ru|none] [--save-every 500] [--eval-every N]
+//!                  [--init ckpt [--start-step N]] [--d-model 256] [--layers 4] [--heads 4] [--copy 32]
+//! cog_engine chat  [--ckpt models/agent.safetensors] [--say "Привет!|Сколько стоит лампа?"] [--think]
+//!                  [--browser sim|chrome] [--temperature 0.7] [--search 1] [--world 42]
+//! cog_engine unified-eval [--ckpt models/agent.safetensors] [--n 256] [--grammar 300] [--episodes 200]
+//! (`agent` / `agent-eval` accept unified checkpoints as well)
 //! ```
+
+mod cli_unified;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -42,6 +53,27 @@ use cog_engine::text::{self, Bpe, Corpus};
 use cog_engine::tools::{Calculator, PythonCalc, RustCalc};
 use cog_engine::train::Trainer;
 use cog_engine::{CogModel, CognitiveEngine, EngineConfig, TrainConfig};
+
+/// Keeps freed tensor memory in the process: candle allocates a fresh buffer for every op, and
+/// with glibc's defaults every large one is a new `mmap` whose pages fault in again (training
+/// runs ~1.7× faster with this).
+fn tune_allocator() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        extern "C" {
+            fn mallopt(param: i32, value: i32) -> i32;
+        }
+        const M_TRIM_THRESHOLD: i32 = -1;
+        const M_TOP_PAD: i32 = -2;
+        const M_MMAP_THRESHOLD: i32 = -3;
+        // SAFETY: plain configuration calls into glibc before any allocation-heavy work.
+        unsafe {
+            mallopt(M_MMAP_THRESHOLD, 32 << 20);
+            mallopt(M_TRIM_THRESHOLD, i32::MAX);
+            mallopt(M_TOP_PAD, 256 << 20);
+        }
+    }
+}
 
 struct Args {
     cmd: String,
@@ -244,8 +276,8 @@ fn load_engine(a: &Args) -> Result<(CognitiveEngine, Meta)> {
     load_engine_from(a, &a.get("ckpt", "model.safetensors"))
 }
 
-/// The shipped browsing agent, used by `agent` / `agent-eval` when no `--ckpt` is given.
-const SHIPPED_AGENT: &str = "models/browser_agent.safetensors";
+/// The shipped agent, used by `agent` / `agent-eval` when no `--ckpt` is given.
+const SHIPPED_AGENT: &str = cli_unified::SHIPPED;
 
 fn load_engine_from(a: &Args, ckpt: &str) -> Result<(CognitiveEngine, Meta)> {
     let meta = Meta::load(ckpt)?;
@@ -521,7 +553,11 @@ fn agent_policy(a: &Args, trace: bool) -> Result<Box<dyn Policy>> {
     match a.get("policy", "model").as_str() {
         "expert" => Ok(Box::new(ExpertPolicy)),
         "model" => {
-            let (engine, meta) = load_engine_from(a, &a.get("ckpt", SHIPPED_AGENT))?;
+            let ckpt = a.get("ckpt", SHIPPED_AGENT);
+            if cog_engine::unified::UnifiedModel::is_checkpoint(&ckpt) {
+                return cli_unified::policy(a, &ckpt, trace);
+            }
+            let (engine, meta) = load_engine_from(a, &ckpt)?;
             if meta.task != Task::Browser {
                 bail!("the checkpoint was trained on '{}', not 'browser' (train with --task browser)", meta.task.name())
             }
@@ -770,6 +806,7 @@ fn cmd_complete(a: &Args) -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    tune_allocator();
     let a = Args::parse()?;
     match a.cmd.as_str() {
         "demo" => cmd_train(&a, true),
@@ -783,8 +820,12 @@ fn main() -> Result<()> {
         "tokenizer" => cmd_tokenizer(&a),
         "complete" => cmd_complete(&a),
         "text-eval" => cmd_text_eval(&a),
+        "train-unified" => cli_unified::cmd_train(&a),
+        "chat" => cli_unified::cmd_chat(&a),
+        "unified-eval" => cli_unified::cmd_eval(&a),
         other => bail!(
-            "unknown command '{other}' (demo | train | infer | bench | serve | agent | agent-eval | site | tokenizer | complete | text-eval)"
+            "unknown command '{other}' (demo | train | infer | bench | serve | agent | agent-eval | site | tokenizer | complete | \
+             text-eval | train-unified | chat | unified-eval)"
         ),
     }
 }

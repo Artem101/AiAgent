@@ -195,6 +195,23 @@ pub fn run_episode(
     world: u64,
     goal: &Goal,
     max_steps: usize,
+    on_step: impl FnMut(&Step),
+) -> Result<Episode> {
+    run_dialog_episode(browser, policy, calc, origin, world, &[], goal, max_steps, on_step)
+}
+
+/// [`run_episode`] for one line of a conversation: the earlier turns `history` are part of
+/// every observation (see [`obs::encode_dialog`]).
+#[allow(clippy::too_many_arguments)]
+pub fn run_dialog_episode(
+    browser: &mut dyn Browser,
+    policy: &mut dyn Policy,
+    calc: &mut dyn Calculator,
+    origin: &str,
+    world: u64,
+    history: &[obs::Turn],
+    goal: &Goal,
+    max_steps: usize,
     mut on_step: impl FnMut(&Step),
 ) -> Result<Episode> {
     browser.goto(&world::home_url(origin, world))?;
@@ -203,7 +220,7 @@ pub fn run_episode(
     let mut note: Option<Note> = None;
     for _ in 0..max_steps {
         let snap = browser.snapshot()?;
-        let observation = obs::encode(&snap, &goal.text, note.as_ref());
+        let observation = obs::encode_dialog(&snap, history, &goal.text, note.as_ref());
         let t0 = Instant::now();
         let output = policy.act(&observation, goal, &snap, note.as_ref())?;
         let think_time = t0.elapsed();

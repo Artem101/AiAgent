@@ -4,12 +4,12 @@
 //!
 //! | family | example | answer |
 //! |---|---|---|
-//! | lookup — find an attribute | «Сколько стоит лампа?», «Кто производитель дрона?» | `12`, `Vega` |
-//! | compare — read and compare two numbers | «Что дешевле: лампа или стул?» | `стул` |
-//! | filter — scan the catalogue for a condition | «Найди товар дешевле 5 ₽.», «Нужен красный товар.» | any matching product |
-//! | calc — arithmetic with the calculator tool | «Сколько будет 5+5?», «Умножь 12 на 3.» | `10`, `36` |
-//! | total — look prices up, then calculate | «Сколько стоят вместе лампа и стул?», «На сколько лампа дороже стула?» | `19`, `5` |
-//! | chat — a few conversational phrases | «Привет!», «Спасибо» | «Привет! Чем помочь?» |
+//! | lookup — find an attribute | «Сколько стоит лампа?», «Кто производитель дрона?» | «Лампа стоит 12 ₽.», «Бренд дрона — Vega.» |
+//! | compare — read and compare two numbers | «Что дешевле: лампа или стул?» | «Стул дешевле.» |
+//! | filter — scan the catalogue for a condition | «Найди товар дешевле 5 ₽.», «Нужен красный товар.» | «Например, зонт.» (any matching product) |
+//! | calc — arithmetic with the calculator tool | «Сколько будет 5+5?», «Умножь 12 на 3.» | «5+5 = 10», «12 * 3 = 36» |
+//! | total — look prices up, then calculate | «Сколько стоят вместе лампа и стул?», «На сколько лампа дороже стула?» | «Вместе 19 ₽.», «Лампа дороже на 5 ₽.» |
+//! | chat — a few conversational phrases | «Привет!», «Спасибо», «Что ты умеешь?» | «Привет! Чем помочь?» |
 //!
 //! Every family has several templates with case forms (именительный, родительный,
 //! винительный). Templates marked *held out* are never used for training: evaluating on them
@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use super::world::{Attr, World, COLORS, ITEMS, MAX_PRICE};
+use super::world::{Attr, World, BRANDS, COLORS, ITEMS, MAX_PRICE};
 use crate::kernels::rng::Rng;
 use crate::tools::calc;
 
@@ -159,7 +159,9 @@ pub enum TotalKind {
     Cheaper,
 }
 
-/// A conversational phrase and its fixed reply.
+/// A conversational phrase. The teacher answers with one of several replies; any reply with
+/// one of the phrase's keywords counts (the model also learns free conversation from dialogues,
+/// see [`crate::dialog`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Chat {
     Hello,
@@ -167,19 +169,50 @@ pub enum Chat {
     Thanks,
     Bye,
     Who,
+    Skills,
 }
 
 impl Chat {
-    pub const ALL: [Chat; 5] = [Self::Hello, Self::HowAreYou, Self::Thanks, Self::Bye, Self::Who];
+    pub const ALL: [Chat; 6] = [Self::Hello, Self::HowAreYou, Self::Thanks, Self::Bye, Self::Who, Self::Skills];
 
-    pub fn reply(self) -> &'static str {
+    /// The teacher's replies (the first one is canonical).
+    pub fn replies(self) -> &'static [&'static str] {
         match self {
-            Self::Hello => "Привет! Чем помочь?",
-            Self::HowAreYou => "Хорошо, спасибо!",
-            Self::Thanks => "Пожалуйста!",
-            Self::Bye => "До встречи!",
-            Self::Who => "Я ваш помощник.",
+            Self::Hello => {
+                &["Привет! Чем помочь?", "Здравствуйте! Чем могу помочь?", "Привет! Что найти или посчитать?"]
+            }
+            Self::HowAreYou => &["Хорошо, спасибо! А у вас?", "Отлично! Чем помочь?", "Всё хорошо, спасибо."],
+            Self::Thanks => &["Пожалуйста!", "Не за что!", "Рад помочь!"],
+            Self::Bye => &["До встречи!", "Пока!", "До свидания!"],
+            Self::Who => &["Я ваш помощник.", "Я помощник: ищу в интернете, считаю и отвечаю на вопросы."],
+            Self::Skills => &[
+                "Ищу товары в магазине, считаю и разговариваю.",
+                "Умею искать в браузере, считать на калькуляторе и отвечать на вопросы.",
+            ],
         }
+    }
+
+    /// The canonical reply.
+    pub fn reply(self) -> &'static str {
+        self.replies()[0]
+    }
+
+    /// Word stems one of which a fitting reply contains.
+    fn keywords(self) -> &'static [&'static str] {
+        match self {
+            Self::Hello => &["привет", "здравств", "добр"],
+            Self::HowAreYou => &["хорош", "отличн", "нормальн", "неплох", "прекрасн"],
+            Self::Thanks => &["пожалуйста", "не за что", "рад"],
+            Self::Bye => &["пока", "встреч", "свидан", "всего"],
+            Self::Who => &["помощник", "ассистент", "агент"],
+            Self::Skills => &["ищу", "искать", "найти", "считаю", "считать", "посчитать"],
+        }
+    }
+
+    /// Whether `reply` fits the phrase.
+    pub fn accepts(self, reply: &str) -> bool {
+        let r = reply.to_lowercase().replace('ё', "е");
+        self.keywords().iter().any(|k| r.contains(k))
     }
 }
 
@@ -279,19 +312,33 @@ impl Spec {
         }
     }
 
-    /// Whether `answer` is correct in `world` (any matching product counts for a filter).
+    /// Whether `answer` is correct in `world`. The answer may be a sentence («Лампа стоит 12 ₽.»):
+    /// the checker extracts what it states — its numbers, the products and values it names — and
+    /// accepts it when that is exactly the right value (any matching product for a filter).
     pub fn accepts(&self, world: &World, answer: &str) -> bool {
         let answer = answer.trim();
+        let words = words_of(answer);
         match *self {
-            Self::Lookup { item, attr } => answer.eq_ignore_ascii_case(&world.answer(item, attr)),
-            Self::Compare { a, b, attr, most } => answer == ITEMS[Self::winner(world, a, b, attr, most)].nom,
-            Self::Filter(cond) => ITEMS.iter().position(|i| i.nom == answer).is_some_and(|i| cond.holds(world, i)),
+            Self::Lookup { item, attr } => match attr {
+                Attr::Price | Attr::Rating => numbers(answer) == [world.answer(item, attr)],
+                Attr::Color => {
+                    let named: Vec<usize> = (0..COLORS.len()).filter(|&c| mentions(&words, &[COLORS[c].0])).collect();
+                    named == [world.color[item]]
+                }
+                Attr::Brand => {
+                    let named: Vec<usize> = (0..BRANDS.len()).filter(|&b| mentions(&words, &[BRANDS[b]])).collect();
+                    named == [world.brand[item]]
+                }
+            },
+            // the product named first is the one the answer is about («Лампа дешевле стула.»)
+            Self::Compare { a, b, attr, most } => first_item(&words) == Some(Self::winner(world, a, b, attr, most)),
+            Self::Filter(cond) => first_item(&words).is_some_and(|i| cond.holds(world, i)),
             Self::Calc { .. } | Self::Total { .. } => {
-                // equal as printed: `10` = `10.0`, and a rounded `3.3333` counts for 10/3
+                // the last number stated; equal as printed: `10` = `10.0`, a rounded `3.3333` counts for 10/3
                 let want = calc::run(&self.calc_expr(world).expect("has an expression"));
-                want.is_ok() && calc::run(answer) == want
+                numbers(answer).last().is_some_and(|n| want.is_ok() && calc::run(n) == want)
             }
-            Self::Chat(c) => answer.to_lowercase() == c.reply().to_lowercase(),
+            Self::Chat(c) => c.accepts(answer),
         }
     }
 
@@ -309,6 +356,123 @@ impl Spec {
                 calc::run(&self.calc_expr(world).expect("has an expression")).unwrap_or_else(|e| e.to_string())
             }
             Self::Chat(c) => c.reply().to_string(),
+        }
+    }
+}
+
+/// Lower-case words of a text (`ё` → `е`).
+fn words_of(text: &str) -> Vec<String> {
+    text.to_lowercase()
+        .replace('ё', "е")
+        .split(|c: char| !c.is_alphanumeric() && c != '-')
+        .filter(|w| !w.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+/// Whether one of `forms` occurs among `words`.
+fn mentions(words: &[String], forms: &[&str]) -> bool {
+    forms.iter().any(|f| {
+        let f = f.to_lowercase().replace('ё', "е");
+        words.contains(&f)
+    })
+}
+
+/// The product named first, in any of its case forms.
+fn first_item(words: &[String]) -> Option<usize> {
+    words
+        .iter()
+        .find_map(|w| ITEMS.iter().position(|it| [it.nom, it.gen, it.acc].iter().any(|f| f.replace('ё', "е") == *w)))
+}
+
+/// The numbers a text states, in order (`-` directly before a digit is a sign, `,` a decimal
+/// comma): «5 + 5 = 10» → `5 5 10`.
+pub fn numbers(text: &str) -> Vec<String> {
+    let c: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < c.len() {
+        if c[i].is_ascii_digit() {
+            let neg = i > 0 && c[i - 1] == '-' && (i < 2 || !c[i - 2].is_ascii_digit());
+            let mut n = String::from(if neg { "-" } else { "" });
+            while i < c.len() && c[i].is_ascii_digit() {
+                n.push(c[i]);
+                i += 1;
+            }
+            if i + 1 < c.len() && (c[i] == '.' || c[i] == ',') && c[i + 1].is_ascii_digit() {
+                n.push('.');
+                i += 1;
+                while i < c.len() && c[i].is_ascii_digit() {
+                    n.push(c[i]);
+                    i += 1;
+                }
+            }
+            out.push(n);
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Sentences the teacher answers with. Every value is written as the page or the calculator
+/// shows it, so the model can copy it.
+pub mod say {
+    use super::super::world::{Attr, ITEMS};
+    use super::TotalKind;
+
+    fn cap(s: &str) -> String {
+        let mut c = s.chars();
+        c.next().map_or(String::new(), |f| f.to_uppercase().chain(c).collect())
+    }
+
+    /// `стоит` / `стоят` (plural-only nouns like «часы»).
+    fn costs(item: usize) -> &'static str {
+        if ITEMS[item].nom == "часы" {
+            "стоят"
+        } else {
+            "стоит"
+        }
+    }
+
+    /// «Лампа стоит 12 ₽.», «Цвет лампы — красный.», «Бренд лампы — Nova.», «Рейтинг лампы — 4 ★.»
+    pub fn lookup(item: usize, attr: Attr, shown: &str) -> String {
+        let it = ITEMS[item];
+        match attr {
+            Attr::Price => format!("{} {} {shown}.", cap(it.nom), costs(item)),
+            Attr::Color => format!("Цвет {} — {shown}.", it.gen),
+            Attr::Brand => format!("Бренд {} — {shown}.", it.gen),
+            Attr::Rating => format!("Рейтинг {} — {shown}.", it.gen),
+        }
+    }
+
+    /// «Лампа дешевле.», «Рейтинг выше у лампы.»
+    pub fn compare(winner: usize, attr: Attr, most: bool) -> String {
+        let it = ITEMS[winner];
+        match (attr, most) {
+            (Attr::Rating, true) => format!("Рейтинг выше у {}.", it.gen),
+            (Attr::Rating, false) => format!("Рейтинг ниже у {}.", it.gen),
+            (_, true) => format!("{} дороже.", cap(it.nom)),
+            (_, false) => format!("{} дешевле.", cap(it.nom)),
+        }
+    }
+
+    /// «Например, лампа.»
+    pub fn filter(item: usize) -> String {
+        format!("Например, {}.", ITEMS[item].nom)
+    }
+
+    /// «12 * 3 = 36» — the calculator's line.
+    pub fn calc(expr: &str, result: &str) -> String {
+        format!("{} = {result}", expr.trim())
+    }
+
+    /// «Вместе 19 ₽.», «Лампа дороже на 5 ₽.», «Лампа дешевле на 5 ₽.»
+    pub fn total(kind: TotalKind, a: usize, result: &str) -> String {
+        match kind {
+            TotalKind::Sum => format!("Вместе {result} ₽."),
+            TotalKind::Pricier => format!("{} дороже на {result} ₽.", cap(ITEMS[a].nom)),
+            TotalKind::Cheaper => format!("{} дешевле на {result} ₽.", cap(ITEMS[a].nom)),
         }
     }
 }
@@ -485,7 +649,13 @@ const CHAT_THANKS: Templates =
     &[("Спасибо!", false), ("Спасибо", false), ("Благодарю!", false), ("Спасибо большое!", true)];
 const CHAT_BYE: Templates = &[("Пока!", false), ("До свидания!", false), ("Пока", false), ("Всего доброго!", true)];
 const CHAT_WHO: Templates =
-    &[("Кто ты?", false), ("Что ты умеешь?", false), ("Ты кто?", false), ("Расскажи о себе.", true)];
+    &[("Кто ты?", false), ("Ты кто?", false), ("Представься.", false), ("Расскажи о себе.", true)];
+const CHAT_SKILLS: Templates = &[
+    ("Что ты умеешь?", false),
+    ("Что ты можешь?", false),
+    ("Чем ты можешь помочь?", false),
+    ("Какие у тебя возможности?", true),
+];
 
 fn lookup_templates(attr: Attr) -> Templates {
     match attr {
@@ -546,6 +716,7 @@ fn templates(spec: &Spec) -> Vec<(&'static str, bool)> {
             Chat::Thanks => CHAT_THANKS,
             Chat::Bye => CHAT_BYE,
             Chat::Who => CHAT_WHO,
+            Chat::Skills => CHAT_SKILLS,
         }
         .to_vec(),
     }
@@ -835,7 +1006,7 @@ mod tests {
 
     #[test]
     fn every_template_family_has_both_splits() {
-        let all: [Templates; 25] = [
+        let all: [Templates; 26] = [
             LOOKUP_PRICE,
             LOOKUP_COLOR,
             LOOKUP_BRAND,
@@ -861,10 +1032,39 @@ mod tests {
             CHAT_THANKS,
             CHAT_BYE,
             CHAT_WHO,
+            CHAT_SKILLS,
         ];
         for t in all {
             assert!(t.iter().any(|x| x.1) && t.iter().any(|x| !x.1));
         }
+    }
+
+    #[test]
+    fn sentence_answers_are_checked_by_what_they_state() {
+        let w = World::new(5);
+        let p = w.price[0];
+        let lookup = Spec::Lookup { item: 0, attr: Attr::Price };
+        assert!(lookup.accepts(&w, &say::lookup(0, Attr::Price, &super::super::world::fmt_price(p))));
+        assert!(lookup.accepts(&w, &format!("{p}")));
+        assert!(!lookup.accepts(&w, &format!("Лампа стоит {} ₽.", p + 1)));
+        assert!(!lookup.accepts(&w, &format!("Лампа стоит {p} ₽, стул — {} ₽.", p + 1)), "two prices");
+        let color = Spec::Lookup { item: 0, attr: Attr::Color };
+        assert!(color.accepts(&w, &say::lookup(0, Attr::Color, COLORS[w.color[0]].0)));
+        assert!(!color.accepts(&w, &format!("Цвет лампы — {}.", COLORS[(w.color[0] + 1) % COLORS.len()].0)));
+        let cmp = Spec::Compare { a: 0, b: 1, attr: Attr::Price, most: false };
+        let (win, lose) = if w.price[0] < w.price[1] { (0, 1) } else { (1, 0) };
+        assert!(cmp.accepts(&w, &say::compare(win, Attr::Price, false)));
+        assert!(cmp.accepts(&w, &format!("{} дешевле, чем {}.", ITEMS[win].nom, ITEMS[lose].nom)));
+        assert!(!cmp.accepts(&w, &say::compare(lose, Attr::Price, false)));
+        let calc = Spec::Calc { expr: Expr::binary(12, Op::Mul, 3), form: CalcForm::Spaced };
+        assert!(calc.accepts(&w, &say::calc("12 * 3", "36")));
+        assert!(!calc.accepts(&w, "12 * 3 = 35"));
+        let sub = Spec::Calc { expr: Expr::binary(100, Op::Sub, 250), form: CalcForm::Spaced };
+        assert!(sub.accepts(&w, "100 - 250 = -150") && !sub.accepts(&w, "100 - 250 = 150"));
+        let total = Spec::Total { a: 0, b: 1, kind: TotalKind::Sum };
+        let sum = (w.price[0] + w.price[1]).to_string();
+        assert!(total.accepts(&w, &say::total(TotalKind::Sum, 0, &sum)));
+        assert_eq!(numbers("Вместе 2,5 ₽ и -3"), ["2.5", "-3"]);
     }
 
     #[test]
@@ -912,6 +1112,8 @@ mod tests {
         assert_eq!(calc("Раздели 10 на 4"), "2.5");
         assert_eq!(recognize("Привет!"), Some(Spec::Chat(Chat::Hello)));
         assert!(Spec::Chat(Chat::Hello).accepts(&w, "привет! чем помочь?"));
+        assert!(Spec::Chat(Chat::Hello).accepts(&w, "Здравствуйте!"));
+        assert!(!Spec::Chat(Chat::Hello).accepts(&w, "Лампа стоит 12 ₽."));
         let t = recognize("Сколько стоят вместе лампа и стул?").unwrap();
         assert_eq!(t.expected(&w), (w.price[0] + w.price[1]).to_string());
     }
