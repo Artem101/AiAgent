@@ -10,11 +10,14 @@ use std::time::{Duration, Instant};
 use candle_core::{bail, DType, Device, Result, Tensor};
 
 use crate::arena::Arena;
+pub use crate::config::ActionDecoder;
 use crate::config::{EngineConfig, PlannerKind};
+use crate::copy::{CopyScratch, PackedCopyHead};
 use crate::flow::{FlowMatchingSampler, ODESolverConfig, PackedHead, PackedVectorField, SamplerBuffers, SolverKind};
+use crate::jepa::planner::DepthStats;
 use crate::jepa::{GradientPlanner, JEPAPlanner, MppiWorkspace, PlanStats, WorldModel};
 use crate::kernels::inplace::{copy_from_slice, host_read};
-use crate::kernels::{rng::Rng, PackedMlp};
+use crate::kernels::{rng::Rng, PackedLinear, PackedMlp};
 use crate::model::CogModel;
 use crate::ttt::{PackedTttEncoder, TttWorkspace};
 use crate::types::{LatentPlan, LatentState, PromptState};
@@ -41,6 +44,23 @@ pub struct Generation {
     pub timings: StageTimings,
     /// Whether latent GD improved on the MPPI plan.
     pub refined: bool,
+}
+
+/// Readable trace of the last latent reasoning ([`CognitiveEngine::last_reasoning`]).
+///
+/// Thoughts are latent states; with a trained thought probe (`JepaConfig::probe_weight > 0`)
+/// each one is also decoded into the action tokens it "has in mind".
+#[derive(Debug, Clone)]
+pub struct Reasoning {
+    pub stats: PlanStats,
+    /// Whether latent GD improved on MPPI.
+    pub refined: bool,
+    /// Per-depth statistics of the tree search (empty when it is off).
+    pub depths: Vec<DepthStats>,
+    /// Surviving hypotheses, best first: energy and the decoded terminal thought.
+    pub hypotheses: Vec<(f32, Vec<u32>)>,
+    /// The chosen plan `s_0 … s_H`, each thought decoded (empty without a probe).
+    pub chain: Vec<Vec<u32>>,
 }
 
 /// Memory held by an engine (see [`CognitiveEngine::memory`]).
@@ -79,9 +99,22 @@ pub struct CognitiveEngine {
     bufs: SamplerBuffers,
     solver: ODESolverConfig,
     head: PackedHead,
+    /// Thought probe `s → [L, d_token]` (decodes latent states for [`Reasoning`]).
+    probe: Option<PackedLinear>,
+    /// Copy mechanism of the probe (points into the prompt's copy memory).
+    copy: Option<PackedCopyHead>,
+    copy_scratch: CopyScratch,
     logits: Box<[f32]>,
+    /// `[L, d_token]` scratch of the probe decoder and `[L, vocab]` vote accumulator.
+    probe_emb: Box<[f32]>,
+    vote: Box<[f32]>,
+    /// Proposals `[thoughts, L]` and their scores for [`ActionDecoder::ProbeConsensus`].
+    proposals: Box<[u32]>,
+    proposal_scores: Box<[f32]>,
+    decoder: ActionDecoder,
     tokens: Box<[u32]>,
     memory: MemoryReport,
+    refined: bool,
 }
 
 impl CognitiveEngine {
@@ -92,7 +125,7 @@ impl CognitiveEngine {
         let host = Device::Cpu;
         let mut arena = Arena::new(&host);
 
-        let ttt = model.ttt.pack(dtype)?;
+        let ttt = model.ttt.pack(dtype, cfg.max_prompt_len)?;
         let ttt_ws = ttt.workspace(&mut arena)?;
         let jepa = model.jepa.pack(dtype)?;
         let (ds, dh) = (cfg.jepa.d_state, cfg.jepa.d_hidden);
@@ -103,6 +136,16 @@ impl CognitiveEngine {
         let vf = model.flow.pack(dtype, &mut arena)?;
         let bufs = SamplerBuffers::new(&mut arena, cfg.answer_len(), cfg.flow.d_token)?;
         let head = model.head.pack(dtype)?;
+        let probe = model.jepa.probe.as_ref().map(|p| p.pack(dtype)).transpose()?;
+        let copy = model.jepa.copy.as_ref().map(|c| c.pack(dtype)).transpose()?;
+        let copy_scratch = CopyScratch::new(
+            &mut arena,
+            copy.as_ref().map_or(0, |c| c.d_key()),
+            if copy.is_some() { cfg.max_prompt_len } else { 0 },
+        );
+        if cfg.decoder != ActionDecoder::Flow && probe.is_none() {
+            bail!("decoder {:?} needs a model trained with a thought probe (jepa.probe_weight > 0)", cfg.decoder)
+        }
 
         let weight_bytes = ttt.bytes()
             + jepa.ctx_enc.bytes()
@@ -110,7 +153,9 @@ impl CognitiveEngine {
             + jepa.world.bytes()
             + jepa.policy.bytes()
             + vf.bytes()
-            + head.lin.bytes();
+            + head.lin.bytes()
+            + probe.as_ref().map_or(0, |p| p.bytes())
+            + copy.as_ref().map_or(0, |c| c.bytes());
         let mut engine = Self {
             jepa_hidden: arena.host(dh),
             s0_host: arena.host(ds),
@@ -118,6 +163,11 @@ impl CognitiveEngine {
             s0: arena.tensor(ds)?,
             goal: arena.tensor(ds)?,
             logits: arena.host(cfg.answer_len() * cfg.vocab_size),
+            probe_emb: arena.host(if probe.is_some() { cfg.answer_len() * cfg.flow.d_token } else { 0 }),
+            vote: arena.host(if probe.is_some() { cfg.answer_len() * cfg.vocab_size } else { 0 }),
+            proposals: arena.host_u32(Self::max_thoughts(&cfg) * cfg.answer_len()),
+            proposal_scores: arena.host(Self::max_thoughts(&cfg)),
+            decoder: cfg.decoder,
             tokens: arena.host_u32(cfg.answer_len()),
             gradient: GradientPlanner {
                 steps: cfg.planner.gd_steps,
@@ -137,6 +187,10 @@ impl CognitiveEngine {
             vf,
             bufs,
             head,
+            probe,
+            copy,
+            copy_scratch,
+            refined: false,
         };
         engine.memory.arena_bytes = arena.bytes();
         engine.memory.arena_buffers = arena.buffers();
@@ -163,6 +217,22 @@ impl CognitiveEngine {
     pub fn set_mppi_iterations(&mut self, iterations: usize) {
         self.cfg.planner.iterations = iterations;
         self.planner.config.iterations = iterations;
+    }
+
+    /// Beam width of the latent tree search (`0` = off; re-allocates the planner buffers).
+    pub fn set_tree(&mut self, beam: usize) -> Result<()> {
+        self.cfg.planner.tree_beam = beam;
+        self.planner.config.tree_beam = beam;
+        let mut arena = Arena::new(&Device::Cpu);
+        self.mppi_ws = self.planner.workspace(&mut arena)?;
+        self.proposals = arena.host_u32(Self::max_thoughts(&self.cfg) * self.cfg.answer_len());
+        self.proposal_scores = arena.host(Self::max_thoughts(&self.cfg));
+        Ok(())
+    }
+
+    /// Thoughts a decision can consult: the plan `s_0 … s_H` and the surviving tree leaves.
+    fn max_thoughts(cfg: &EngineConfig) -> usize {
+        cfg.plan_len() + cfg.planner.tree_beam
     }
 
     /// Enables/disables the policy warm start (zero-action warm start when off).
@@ -209,7 +279,78 @@ impl CognitiveEngine {
                 refined = true;
             }
         }
+        self.refined = refined;
         Ok((LatentPlan::new(self.mppi_ws.plan.clone(), self.cfg.plan_len(), ds)?, stats, refined))
+    }
+
+    /// Log-probabilities `[L, vocab]` of the tokens a latent `state` stands for: the probe's
+    /// embedding unembedded by the shared head, mixed with pointers into the prompt when the
+    /// model has a copy mechanism. No allocation.
+    #[allow(clippy::too_many_arguments)]
+    fn probe_logp(
+        probe: &PackedLinear,
+        head: &PackedHead,
+        copy: Option<&PackedCopyHead>,
+        memory: (&[f32], &[u32]),
+        scratch: &mut CopyScratch,
+        state: &[f32],
+        emb: &mut [f32],
+        rows: &mut [f32],
+    ) {
+        probe.forward(state, emb);
+        head.lin.forward(emb, rows);
+        match copy {
+            Some(c) => {
+                c.mix(emb, rows, memory.0, memory.1, scratch);
+                rows.iter_mut().for_each(|x| *x = (*x + 1e-12).ln());
+            }
+            None => {
+                for row in rows.chunks_exact_mut(head.vocab()) {
+                    let m = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let lse = m + row.iter().map(|x| (x - m).exp()).sum::<f32>().ln();
+                    row.iter_mut().for_each(|x| *x -= lse);
+                }
+            }
+        }
+    }
+
+    fn argmax_rows(rows: &[f32], vocab: usize, out: &mut [u32]) {
+        for (o, row) in out.iter_mut().zip(rows.chunks_exact(vocab)) {
+            *o = row.iter().enumerate().fold((0, f32::NEG_INFINITY), |b, (i, &x)| if x > b.1 { (i, x) } else { b }).0
+                as u32;
+        }
+    }
+
+    /// Decodes a latent state with the thought probe (`None` without a probe; allocates).
+    pub fn decode_thought(&self, state: &[f32]) -> Option<Vec<u32>> {
+        let probe = self.probe.as_ref()?;
+        let (l, dt, v) = (self.cfg.answer_len(), self.cfg.flow.d_token, self.head.vocab());
+        let (mut emb, mut rows, mut out) = (vec![0f32; l * dt], vec![0f32; l * v], vec![0u32; l]);
+        let mut scratch = CopyScratch::new(
+            &mut Arena::new(&Device::Cpu),
+            self.copy.as_ref().map_or(0, |c| c.d_key()),
+            self.cfg.max_prompt_len,
+        );
+        let memory = self.ttt_ws.copy_memory();
+        Self::probe_logp(probe, &self.head, self.copy.as_ref(), memory, &mut scratch, state, &mut emb, &mut rows);
+        Self::argmax_rows(&rows, v, &mut out);
+        Some(out)
+    }
+
+    /// The latent reasoning of the last [`CognitiveEngine::think`]: tree statistics, surviving
+    /// hypotheses and the chosen chain of thoughts, decoded by the probe (allocates; call it
+    /// outside hot loops).
+    pub fn last_reasoning(&self, stats: PlanStats) -> Result<Reasoning> {
+        let ds = self.cfg.jepa.d_state;
+        let h = self.cfg.jepa.horizon;
+        let hypotheses = self
+            .mppi_ws
+            .hypotheses()
+            .map(|(e, traj)| (e, self.decode_thought(&traj[h * ds..]).unwrap_or_default()))
+            .collect();
+        let plan = self.mppi_ws.plan.flatten_all()?.to_vec1::<f32>()?;
+        let chain = plan.chunks_exact(ds).filter_map(|s| self.decode_thought(s)).collect();
+        Ok(Reasoning { stats, refined: self.refined, depths: self.mppi_ws.tree_depths().collect(), hypotheses, chain })
     }
 
     /// Stage 3: integrate the flow from noise to `X_1` and unembed all positions at once.
@@ -224,6 +365,112 @@ impl CognitiveEngine {
         host_read(&self.bufs.x, |x| head.decode_into(x, logits, out))
     }
 
+    /// Selects how actions are decoded from the plan (see [`ActionDecoder`]).
+    pub fn set_decoder(&mut self, decoder: ActionDecoder) -> Result<()> {
+        if decoder != ActionDecoder::Flow && self.probe.is_none() {
+            bail!("the probe decoder needs a model trained with a thought probe (jepa.probe_weight > 0)")
+        }
+        self.decoder = decoder;
+        Ok(())
+    }
+
+    pub fn decoder(&self) -> ActionDecoder {
+        self.decoder
+    }
+
+    /// Stage 3 with the probe: `out = argmax P(· | Θ_probe s_t)` for plan state `t` (no
+    /// allocation).
+    fn decode_probe(&mut self, t: usize, out: &mut [u32]) -> Result<()> {
+        let Some(probe) = &self.probe else { bail!("no thought probe") };
+        let ds = self.cfg.jepa.d_state;
+        let Self { probe_emb, head, logits, copy, copy_scratch, ttt_ws, mppi_ws, .. } = self;
+        host_read(&mppi_ws.plan, |plan| {
+            let state = &plan[t * ds..(t + 1) * ds];
+            let memory = ttt_ws.copy_memory();
+            Self::probe_logp(probe, head, copy.as_ref(), memory, copy_scratch, state, probe_emb, logits);
+        })?;
+        Self::argmax_rows(logits, head.vocab(), out);
+        Ok(())
+    }
+
+    /// Stage 3 by self-consistency (see [`ActionDecoder::ProbeVote`]); no allocation.
+    fn decode_vote(&mut self, out: &mut [u32]) -> Result<()> {
+        let Some(probe) = &self.probe else { bail!("no thought probe") };
+        let (ds, h) = (self.cfg.jepa.d_state, self.cfg.jepa.horizon);
+        let Self { probe_emb, head, logits, vote, mppi_ws, copy, copy_scratch, ttt_ws, .. } = self;
+        let memory = ttt_ws.copy_memory();
+        vote.fill(0.0);
+        {
+            let mut add = |state: &[f32]| {
+                Self::probe_logp(probe, head, copy.as_ref(), memory, copy_scratch, state, probe_emb, logits);
+                vote.iter_mut().zip(logits.iter()).for_each(|(a, &x)| *a += x);
+            };
+            host_read(&mppi_ws.plan, |plan| plan.chunks_exact(ds).for_each(&mut add))?;
+            for (_, traj) in mppi_ws.hypotheses() {
+                add(&traj[h * ds..]);
+            }
+        }
+        Self::argmax_rows(vote, head.vocab(), out);
+        Ok(())
+    }
+
+    /// Stage 3 by sequence-level self-consistency (see [`ActionDecoder::ProbeConsensus`]); no
+    /// allocation.
+    fn decode_consensus(&mut self, out: &mut [u32]) -> Result<()> {
+        let Some(probe) = &self.probe else { bail!("no thought probe") };
+        let (ds, h, l) = (self.cfg.jepa.d_state, self.cfg.jepa.horizon, self.cfg.answer_len());
+        let Self { probe_emb, head, logits, mppi_ws, copy, copy_scratch, ttt_ws, proposals, proposal_scores, .. } =
+            self;
+        let memory = ttt_ws.copy_memory();
+        let v = head.vocab();
+        // pass 1: every thought proposes its action; pass 2: every thought scores every proposal
+        proposal_scores.fill(0.0);
+        for pass in 0..2 {
+            let mut n = 0;
+            let mut visit = |state: &[f32]| {
+                Self::probe_logp(probe, head, copy.as_ref(), memory, copy_scratch, state, probe_emb, logits);
+                if pass == 0 {
+                    Self::argmax_rows(logits, v, &mut proposals[n * l..(n + 1) * l]);
+                    n += 1;
+                } else {
+                    for (score, prop) in proposal_scores.iter_mut().zip(proposals.chunks_exact(l)) {
+                        *score += prop.iter().enumerate().map(|(i, &t)| logits[i * v + t as usize]).sum::<f32>();
+                    }
+                }
+            };
+            host_read(&mppi_ws.plan, |plan| plan.chunks_exact(ds).for_each(&mut visit))?;
+            for (_, traj) in mppi_ws.hypotheses() {
+                visit(&traj[h * ds..]);
+            }
+            if pass == 0 {
+                // proposals that were not made this time (fewer leaves) must not win
+                proposal_scores[n..].fill(f32::NEG_INFINITY);
+            }
+        }
+        let best = proposal_scores
+            .iter()
+            .enumerate()
+            .fold((0, f32::NEG_INFINITY), |b, (i, &x)| if x > b.1 { (i, x) } else { b })
+            .0;
+        out.copy_from_slice(&proposals[best * l..(best + 1) * l]);
+        Ok(())
+    }
+
+    /// Proposals of the last [`ActionDecoder::ProbeConsensus`] decision, best first and without
+    /// duplicates: `(summed log-probability over all thoughts, tokens)` (allocates). A caller
+    /// that knows its output grammar can take the best *valid* proposal instead of the best one.
+    pub fn ranked_proposals(&self) -> Vec<(f32, Vec<u32>)> {
+        let l = self.cfg.answer_len();
+        let mut out: Vec<(f32, Vec<u32>)> = Vec::new();
+        for (&score, prop) in self.proposal_scores.iter().zip(self.proposals.chunks_exact(l)) {
+            if score.is_finite() && !out.iter().any(|(_, p)| p == prop) {
+                out.push((score, prop.to_vec()));
+            }
+        }
+        out.sort_by(|a, b| b.0.total_cmp(&a.0));
+        out
+    }
+
     /// Full pipeline into a caller-provided buffer (`out.len() == answer_len`).
     pub fn generate_into(&mut self, prompt: &[u32], seed: u64, out: &mut [u32]) -> Result<Generation> {
         let t0 = Instant::now();
@@ -231,7 +478,18 @@ impl CognitiveEngine {
         let t1 = Instant::now();
         let (plan, stats, refined) = self.think(&s_prompt, seed)?;
         let t2 = Instant::now();
-        self.decode(&plan, seed, out)?;
+        match self.decoder {
+            ActionDecoder::Flow => self.decode(&plan, seed, out)?,
+            ActionDecoder::Probe => self.decode_probe(self.cfg.jepa.horizon, out)?,
+            ActionDecoder::ProbeStart => self.decode_probe(0, out)?,
+            ActionDecoder::ProbeVote => self.decode_vote(out)?,
+            ActionDecoder::ProbeConsensus => self.decode_consensus(out)?,
+            ActionDecoder::ProbeFirst => {
+                self.decode_consensus(out)?;
+                let l = self.cfg.answer_len();
+                out.copy_from_slice(&self.proposals[..l]); // the proposal of s_0
+            }
+        }
         let t3 = Instant::now();
         Ok(Generation {
             plan: stats,

@@ -20,6 +20,25 @@
 //! instead of zero actions (amortised planning, as in TD-MPC). MPPI keeps the best
 //! trajectory seen, so its energy is never worse than the warm start.
 //!
+//! **Latent tree search** (`PlannerConfig::tree_beam > 0`) replaces the single policy rollout
+//! as the warm start — a beam search over "thoughts" in latent space:
+//!
+//! ```text
+//!   beam = {s_0}
+//!   for t in 0..H:                                     (depth = one thought step)
+//!     for every node b in the beam, k in 0..K:
+//!       a = clip(tanh π([s_t^b ; ĝ]) + ε_{t,b,k}),  ε_{·,·,0} = 0      (proposal k)
+//!       s_{t+1} = P_φ(s_t^b, a)
+//!       complete greedily with π up to H → a full hypothesis, score = E(hypothesis)
+//!     keep the B hypotheses with the lowest energy, prune the rest (dead ends)
+//! ```
+//!
+//! Child `k = 0` of the best node reproduces its parent's completion, so the best energy never
+//! increases with depth and the result is never worse than the plain policy rollout. The
+//! search is sequential and allocation-free; the per-depth statistics and the surviving
+//! hypotheses stay in the workspace ([`MppiWorkspace::tree_depths`],
+//! [`MppiWorkspace::hypotheses`]).
+//!
 //! **Latent GD** ([`GradientPlanner`]) refines the MPPI actions by back-propagating the same
 //! energy through the (differentiable, candle) world model.
 
@@ -45,6 +64,34 @@ pub struct PlanStats {
     pub initial_energy: f32,
     /// Effective sample size `1 / Σ w_m²` of the last MPPI iteration.
     pub effective_samples: f32,
+    /// Energy of the plain policy rollout (the greedy chain of thoughts).
+    pub greedy_energy: f32,
+    /// Hypotheses expanded and pruned by the tree search (0 when it is off).
+    pub tree_nodes: u32,
+    pub tree_pruned: u32,
+}
+
+impl std::fmt::Display for PlanStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.tree_nodes > 0 {
+            write!(
+                f,
+                "{} hypotheses, {} pruned | energy: greedy {:.4} → tree {:.4} → final {:.4} | ESS {:.1}",
+                self.tree_nodes,
+                self.tree_pruned,
+                self.greedy_energy,
+                self.initial_energy,
+                self.energy,
+                self.effective_samples
+            )
+        } else {
+            write!(
+                f,
+                "energy {:.4} (warm start {:.4}), ESS {:.1}",
+                self.energy, self.initial_energy, self.effective_samples
+            )
+        }
+    }
 }
 
 /// Per-sample view handed to a rollout task: `(m, ((((actions, states), cat), hidden), cost))`.
@@ -66,14 +113,61 @@ pub struct MppiWorkspace {
     best_actions: Box<[f32]>,
     pol_in: Box<[f32]>,
     pol_hidden: Box<[f32]>,
+    tree: TreeBuffers,
     /// The resulting plan `[H + 1, d_s]`.
     pub plan: Tensor,
+}
+
+/// Buffers of the latent tree search (empty when it is off).
+#[derive(Debug)]
+struct TreeBuffers {
+    /// Surviving hypotheses: full trajectories `B × (H + 1) × d_s`, actions `B × H × d_a`,
+    /// energies `B` (sorted, best first).
+    beam_states: Box<[f32]>,
+    beam_actions: Box<[f32]>,
+    beam_cost: Box<[f32]>,
+    beam_len: usize,
+    /// Children of one depth: `B·K` hypotheses.
+    cand_states: Box<[f32]>,
+    cand_actions: Box<[f32]>,
+    cand_cost: Box<[f32]>,
+    order: Box<[u32]>,
+    /// Per depth: `[expanded, best kept, worst kept, best pruned (NaN if none)]`.
+    depths: Box<[f32]>,
+}
+
+/// Statistics of one depth of the tree search.
+#[derive(Debug, Clone, Copy)]
+pub struct DepthStats {
+    pub expanded: usize,
+    pub best_kept: f32,
+    pub worst_kept: f32,
+    /// Lowest energy among the pruned hypotheses (`None` if nothing was pruned).
+    pub best_pruned: Option<f32>,
 }
 
 impl MppiWorkspace {
     /// Nominal (optimised) action sequence `[H · d_a]`.
     pub fn nominal_actions(&self) -> &[f32] {
         &self.nominal
+    }
+
+    /// Per-depth statistics of the last tree search (empty when it is off).
+    pub fn tree_depths(&self) -> impl Iterator<Item = DepthStats> + '_ {
+        let n = if self.tree.beam_len > 0 { self.tree.depths.len() / 4 } else { 0 };
+        self.tree.depths.chunks_exact(4).take(n).map(|d| DepthStats {
+            expanded: d[0] as usize,
+            best_kept: d[1],
+            worst_kept: d[2],
+            best_pruned: (!d[3].is_nan()).then_some(d[3]),
+        })
+    }
+
+    /// Surviving hypotheses of the last tree search, best first: `(energy, trajectory [H + 1, d_s])`.
+    pub fn hypotheses(&self) -> impl Iterator<Item = (f32, &[f32])> + '_ {
+        let t = &self.tree;
+        let len = if t.beam_len > 0 { t.beam_states.len() / t.beam_cost.len().max(1) } else { 0 };
+        t.beam_cost.iter().zip(t.beam_states.chunks_exact(len.max(1))).take(t.beam_len).map(|(&c, s)| (c, s))
     }
 }
 
@@ -132,8 +226,57 @@ impl JEPAPlanner {
             best_actions: arena.host(h * da),
             pol_in: arena.host(2 * ds),
             pol_hidden: arena.host(self.policy.as_ref().map_or(0, |p| p.l1.d_out)),
+            tree: {
+                let (b, k) =
+                    if self.tree_enabled() { (self.config.tree_beam, self.config.tree_branch.max(1)) } else { (0, 0) };
+                TreeBuffers {
+                    beam_states: arena.host(b * (h + 1) * ds),
+                    beam_actions: arena.host(b * h * da),
+                    beam_cost: arena.host(b),
+                    beam_len: 0,
+                    cand_states: arena.host(b * k * (h + 1) * ds),
+                    cand_actions: arena.host(b * k * h * da),
+                    cand_cost: arena.host(b * k),
+                    order: arena.host_u32(b * k),
+                    depths: arena.host(if b > 0 { 4 * h } else { 0 }),
+                }
+            },
             plan: arena.tensor((h + 1, ds))?,
         })
+    }
+
+    /// Whether the latent tree search runs (it needs the policy prior).
+    pub fn tree_enabled(&self) -> bool {
+        self.config.tree_beam > 0 && self.config.policy_prior && self.policy.is_some()
+    }
+
+    /// Completes a hypothesis greedily with the policy: `states[..=from]` and `actions[..from]`
+    /// are given, the rest up to depth `H` is filled in. Returns its energy.
+    #[allow(clippy::too_many_arguments)]
+    fn complete(
+        &self,
+        pi: &PackedMlp,
+        from: usize,
+        states: &mut [f32],
+        actions: &mut [f32],
+        goal: &[f32],
+        pol_in: &mut [f32],
+        pol_hidden: &mut [f32],
+        cat: &mut [f32],
+        hidden: &mut [f32],
+    ) -> f32 {
+        let wm = &self.world_model;
+        let (h, ds, da) = (self.horizon, wm.d_state, wm.d_action);
+        for t in from..h {
+            pol_in[..ds].copy_from_slice(&states[t * ds..(t + 1) * ds]);
+            pol_in[ds..].copy_from_slice(goal);
+            let a = &mut actions[t * da..(t + 1) * da];
+            pi.forward(pol_in, pol_hidden, a);
+            tanh_inplace(a);
+            let (done, rest) = states.split_at_mut((t + 1) * ds);
+            wm.step(&done[t * ds..], a, cat, hidden, &mut rest[..ds]);
+        }
+        self.energy(&states[h * ds..], goal, actions)
     }
 
     /// `E = ‖s_H − g‖²/d_s + λ_a ‖A‖²/(H d_a)`.
@@ -174,11 +317,90 @@ impl JEPAPlanner {
             best_actions,
             pol_in,
             pol_hidden,
+            tree,
             plan,
         } = ws;
 
-        // warm start: policy rollout, or zero actions
+        // warm start: latent tree search, policy rollout, or zero actions
+        let (mut tree_nodes, mut tree_pruned) = (0u32, 0u32);
+        tree.beam_len = 0;
+        let mut greedy_energy = f32::NAN;
         match &self.policy {
+            Some(pi) if self.tree_enabled() => {
+                let (b_max, k_max) = (self.config.tree_beam, self.config.tree_branch.max(1));
+                let (sl, al) = ((h + 1) * ds, h * da);
+                let (cat1, hid1) = (&mut cat[..ds + da], &mut hidden[..dh]);
+                // root: the greedy chain from s_0
+                tree.beam_states[..ds].copy_from_slice(s0);
+                tree.beam_cost[0] = self.complete(
+                    pi,
+                    0,
+                    &mut tree.beam_states[..sl],
+                    &mut tree.beam_actions[..al],
+                    goal,
+                    pol_in,
+                    pol_hidden,
+                    cat1,
+                    hid1,
+                );
+                greedy_energy = tree.beam_cost[0];
+                tree.beam_len = 1;
+                let sigma = self.config.tree_noise as f32;
+                for t in 0..h {
+                    let mut n = 0;
+                    for b in 0..tree.beam_len {
+                        for k in 0..k_max {
+                            let (cs, ca) = (
+                                &mut tree.cand_states[n * sl..(n + 1) * sl],
+                                &mut tree.cand_actions[n * al..(n + 1) * al],
+                            );
+                            cs[..(t + 1) * ds].copy_from_slice(&tree.beam_states[b * sl..b * sl + (t + 1) * ds]);
+                            ca[..t * da].copy_from_slice(&tree.beam_actions[b * al..b * al + t * da]);
+                            // proposal k: the policy's action, perturbed for k > 0
+                            pol_in[..ds].copy_from_slice(&cs[t * ds..(t + 1) * ds]);
+                            pol_in[ds..].copy_from_slice(goal);
+                            let a = &mut ca[t * da..(t + 1) * da];
+                            pi.forward(pol_in, pol_hidden, a);
+                            tanh_inplace(a);
+                            if k > 0 {
+                                let mut rng = Rng::stream(seed ^ 0x07EE_5EED, t as u64, (b * k_max + k) as u64);
+                                for x in a.iter_mut() {
+                                    *x = (*x + sigma * rng.normal()).clamp(-1.0, 1.0);
+                                }
+                            }
+                            let (done, rest) = cs.split_at_mut((t + 1) * ds);
+                            wm.step(&done[t * ds..], a, cat1, hid1, &mut rest[..ds]);
+                            tree.cand_cost[n] = self.complete(pi, t + 1, cs, ca, goal, pol_in, pol_hidden, cat1, hid1);
+                            n += 1;
+                        }
+                    }
+                    // keep the B best hypotheses (ties → lower index, deterministic)
+                    let order = &mut tree.order[..n];
+                    for (i, o) in order.iter_mut().enumerate() {
+                        *o = i as u32;
+                    }
+                    let cost = &tree.cand_cost;
+                    order.sort_unstable_by(|&x, &y| cost[x as usize].total_cmp(&cost[y as usize]).then(x.cmp(&y)));
+                    let keep = b_max.min(n);
+                    let d = &mut tree.depths[4 * t..4 * t + 4];
+                    d[0] = n as f32;
+                    d[1] = cost[order[0] as usize];
+                    d[2] = cost[order[keep - 1] as usize];
+                    d[3] = if n > keep { cost[order[keep] as usize] } else { f32::NAN };
+                    tree_nodes += n as u32;
+                    tree_pruned += (n - keep) as u32;
+                    for (i, &c) in order[..keep].iter().enumerate() {
+                        let c = c as usize;
+                        tree.beam_states[i * sl..(i + 1) * sl].copy_from_slice(&tree.cand_states[c * sl..(c + 1) * sl]);
+                        tree.beam_actions[i * al..(i + 1) * al]
+                            .copy_from_slice(&tree.cand_actions[c * al..(c + 1) * al]);
+                        tree.beam_cost[i] = tree.cand_cost[c];
+                    }
+                    tree.beam_len = keep;
+                }
+                nominal.copy_from_slice(&tree.beam_actions[..al]);
+                best.copy_from_slice(&tree.beam_states[..sl]);
+            }
             Some(pi) if self.config.policy_prior => {
                 best[..ds].copy_from_slice(s0);
                 for t in 0..h {
@@ -197,6 +419,9 @@ impl JEPAPlanner {
             }
         }
         let initial_energy = self.energy(&best[h * ds..], goal, nominal);
+        if greedy_energy.is_nan() {
+            greedy_energy = initial_energy;
+        }
         let mut best_cost = initial_energy;
         best_actions.copy_from_slice(nominal);
         let mut ess = m as f32;
@@ -281,7 +506,15 @@ impl JEPAPlanner {
         let energy = self.energy(&best[h * ds..], goal, nominal);
         let terminal_error = self.energy(&best[h * ds..], goal, &[]);
         copy_from_slice(plan, best)?;
-        Ok(PlanStats { energy, terminal_error, initial_energy, effective_samples: ess })
+        Ok(PlanStats {
+            energy,
+            terminal_error,
+            initial_energy,
+            effective_samples: ess,
+            greedy_energy,
+            tree_nodes,
+            tree_pruned,
+        })
     }
 
     /// Allocating convenience with the spec signature: plans from `initial_state [d_s]`
@@ -411,6 +644,52 @@ mod tests {
         // spec-style allocating API
         let plan = planner.plan(s0.tensor(), goal.tensor(), &dev)?;
         assert_eq!(plan.len(), planner.horizon + 1);
+        Ok(())
+    }
+
+    #[test]
+    fn tree_search_prunes_and_never_loses_to_greedy() -> Result<()> {
+        let dev = Device::Cpu;
+        let mut cfg = EngineConfig::tiny(10, 8, 8);
+        cfg.jepa.horizon = 8;
+        cfg.planner.tree_beam = 3;
+        cfg.planner.tree_branch = 4;
+        cfg.planner.iterations = 0; // look at the tree alone
+        let (j, mut ps) = (&cfg.jepa, ParamStore::new(&dev, 5));
+        let wm = WorldModel::new(&mut ps, "wm", j.d_state, j.d_action, j.d_hidden)?;
+        let policy = ps.mlp("pi", 2 * j.d_state, j.d_hidden, j.d_action)?.pack(DType::F32)?;
+        let planner = JEPAPlanner::new(wm.pack(DType::F32)?, j.horizon, &cfg.planner).with_policy(policy);
+        assert!(planner.tree_enabled());
+        let (ds, h) = (j.d_state, j.horizon);
+        let mut ws = planner.workspace(&mut Arena::new(&dev))?;
+        for trial in 0..5u64 {
+            let s0 = LatentState::new(Tensor::randn(0f32, 1.0, ds, &dev)?, ds)?;
+            let goal = LatentState::new(Tensor::randn(0f32, 1.0, ds, &dev)?, ds)?;
+            let stats = planner.plan_into(&s0, &goal, &mut ws, trial)?;
+            // K children at the root, B·K at every other depth; all but B are pruned
+            assert_eq!(stats.tree_nodes as usize, 4 + 3 * 4 * (h - 1));
+            assert_eq!(stats.tree_pruned as usize, stats.tree_nodes as usize - 3 * h);
+            assert!(stats.initial_energy <= stats.greedy_energy, "{stats:?}");
+            let depths: Vec<_> = ws.tree_depths().collect();
+            assert_eq!(depths.len(), h);
+            for w in depths.windows(2) {
+                assert!(w[1].best_kept <= w[0].best_kept, "best hypothesis never gets worse: {depths:?}");
+            }
+            let hyps: Vec<f32> = ws
+                .hypotheses()
+                .map(|(e, traj)| {
+                    assert_eq!(traj.len(), (h + 1) * ds);
+                    e
+                })
+                .collect();
+            assert_eq!(hyps.len(), 3);
+            assert!(hyps.windows(2).all(|w| w[0] <= w[1]));
+            assert_eq!(hyps[0], stats.initial_energy);
+            // deterministic
+            let first = ws.plan.to_vec2::<f32>()?;
+            planner.plan_into(&s0, &goal, &mut ws, trial)?;
+            assert_eq!(first, ws.plan.to_vec2::<f32>()?);
+        }
         Ok(())
     }
 }

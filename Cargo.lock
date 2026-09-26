@@ -193,6 +193,7 @@ dependencies = [
  "candle-nn",
  "half",
  "rayon",
+ "serde_json",
  "tokio",
 ]
 

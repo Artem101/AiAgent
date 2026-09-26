@@ -1,0 +1,118 @@
+panel,series,step,value
+agent3,S: small,1000,29.0
+steps3,S: small,1000,50.2
+calc3,S: small,1000,13.9
+text3,S: small,1000,3.2
+agent3,S: small,2000,38.0
+steps3,S: small,2000,60.2
+calc3,S: small,2000,50.0
+text3,S: small,2000,3.2
+agent3,S: small,3000,29.0
+steps3,S: small,3000,52.2
+calc3,S: small,3000,33.3
+text3,S: small,3000,3.4
+agent3,S: small,4000,38.0
+steps3,S: small,4000,61.6
+calc3,S: small,4000,55.6
+text3,S: small,4000,3.4
+agent3,S: small,5000,49.0
+steps3,S: small,5000,62.4
+calc3,S: small,5000,61.1
+text3,S: small,5000,3.4
+agent3,S: small,6000,43.5
+steps3,S: small,6000,64.0
+calc3,S: small,6000,69.4
+text3,S: small,6000,3.6
+agent3,S: small,7000,47.0
+steps3,S: small,7000,66.8
+calc3,S: small,7000,69.4
+text3,S: small,7000,3.2
+agent3,S: small,8000,49.0
+steps3,S: small,8000,64.6
+calc3,S: small,8000,66.7
+text3,S: small,8000,3.4
+agent3,S: small,9000,51.5
+steps3,S: small,9000,64.6
+calc3,S: small,9000,66.7
+text3,S: small,9000,3.6
+agent3,TD: tiny,1000,28.0
+steps3,TD: tiny,1000,48.0
+calc3,TD: tiny,1000,22.2
+text3,TD: tiny,1000,2.6
+agent3,TD: tiny,2000,30.0
+steps3,TD: tiny,2000,54.2
+calc3,TD: tiny,2000,13.9
+text3,TD: tiny,2000,2.8
+agent3,TD: tiny,3000,38.0
+steps3,TD: tiny,3000,55.0
+calc3,TD: tiny,3000,16.7
+text3,TD: tiny,3000,3.4
+agent3,TD: tiny,4000,34.5
+steps3,TD: tiny,4000,55.2
+calc3,TD: tiny,4000,30.6
+text3,TD: tiny,4000,2.8
+agent3,TD: tiny,5000,35.5
+steps3,TD: tiny,5000,61.2
+calc3,TD: tiny,5000,61.1
+text3,TD: tiny,5000,3.2
+agent3,TD: tiny,6000,35.0
+steps3,TD: tiny,6000,62.4
+calc3,TD: tiny,6000,44.4
+text3,TD: tiny,6000,3.8
+agent3,TD: tiny,7000,49.0
+steps3,TD: tiny,7000,63.8
+calc3,TD: tiny,7000,72.2
+text3,TD: tiny,7000,3.6
+agent3,TD: tiny,8000,41.5
+steps3,TD: tiny,8000,64.2
+calc3,TD: tiny,8000,63.9
+text3,TD: tiny,8000,3.8
+agent3,TD: tiny,9000,41.5
+steps3,TD: tiny,9000,61.2
+calc3,TD: tiny,9000,55.6
+text3,TD: tiny,9000,3.4
+agent3,T0: tiny без копир.,1000,8.0
+steps3,T0: tiny без копир.,1000,26.8
+calc3,T0: tiny без копир.,1000,0.0
+text3,T0: tiny без копир.,1000,3.2
+agent3,T0: tiny без копир.,2000,15.5
+steps3,T0: tiny без копир.,2000,27.8
+calc3,T0: tiny без копир.,2000,0.0
+text3,T0: tiny без копир.,2000,2.4
+agent3,T0: tiny без копир.,3000,14.5
+steps3,T0: tiny без копир.,3000,31.0
+calc3,T0: tiny без копир.,3000,2.8
+text3,T0: tiny без копир.,3000,2.6
+agent3,T0: tiny без копир.,4000,16.0
+steps3,T0: tiny без копир.,4000,31.8
+calc3,T0: tiny без копир.,4000,2.8
+text3,T0: tiny без копир.,4000,2.8
+agent3,T0: tiny без копир.,5000,14.5
+steps3,T0: tiny без копир.,5000,32.4
+calc3,T0: tiny без копир.,5000,2.8
+text3,T0: tiny без копир.,5000,2.0
+agent3,T0: tiny без копир.,6000,18.5
+steps3,T0: tiny без копир.,6000,33.0
+calc3,T0: tiny без копир.,6000,2.8
+text3,T0: tiny без копир.,6000,3.0
+agent3,T0: tiny без копир.,7000,18.0
+steps3,T0: tiny без копир.,7000,33.0
+calc3,T0: tiny без копир.,7000,2.8
+text3,T0: tiny без копир.,7000,4.4
+agent3,T0: tiny без копир.,8000,17.0
+steps3,T0: tiny без копир.,8000,35.6
+calc3,T0: tiny без копир.,8000,2.8
+text3,T0: tiny без копир.,8000,2.0
+agent3,T0: tiny без копир.,9000,16.5
+steps3,T0: tiny без копир.,9000,36.2
+calc3,T0: tiny без копир.,9000,5.6
+text3,T0: tiny без копир.,9000,2.8
+text3,ref:биграммы,1000,10.4
+text3,ref:биграммы,2000,10.4
+text3,ref:биграммы,3000,10.4
+text3,ref:биграммы,4000,10.4
+text3,ref:биграммы,5000,10.4
+text3,ref:биграммы,6000,10.4
+text3,ref:биграммы,7000,10.4
+text3,ref:биграммы,8000,10.4
+text3,ref:биграммы,9000,10.4
