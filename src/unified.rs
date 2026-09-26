@@ -73,13 +73,14 @@ pub struct UnifiedConfig {
 }
 
 impl UnifiedConfig {
-    /// `tiny` (tests, ~1 M parameters) or `base` (the shipped model).
+    /// `tiny` (tests, ~1 M parameters), `base` (the shipped model, 7.7 M), and the scaled-up
+    /// `m` (~14 M) and `l` (~24 M) of docs/scaling.md.
     pub fn preset(name: &str) -> Result<Self> {
         let vocab = text::ru().vocab_size();
         let base = match name {
             "tiny" => false,
-            "base" => true,
-            other => bail!("unknown unified preset '{other}' (tiny | base)"),
+            "base" | "m" | "l" => true,
+            other => bail!("unknown unified preset '{other}' (tiny | base | m | l)"),
         };
         let mut e = EngineConfig::preset(if base { "small" } else { "tiny" }, vocab, OBS_LEN, ACTION_LEN)?;
         e.ttt.conv_width = browser::CONV_WIDTH;
@@ -97,7 +98,32 @@ impl UnifiedConfig {
         } else {
             SpeechConfig { d_model: 64, n_layers: 2, n_heads: 4, mlp_ratio: 2, max_len: ACTION_LEN, copy_dim: 16 }
         };
-        Ok(Self { preset: name.to_string(), engine: e, speech, teacher_plan: 0.3, plan_noise: 0.05 })
+        let mut c = Self { preset: name.to_string(), engine: e, speech, teacher_plan: 0.3, plan_noise: 0.05 };
+        match name {
+            "m" => c.scale(160, 96, 256, (96, 24, 384), (320, 6, 5, 48)),
+            "l" => c.scale(256, 128, 320, (128, 32, 512), (512, 4, 8, 64)),
+            _ => {}
+        }
+        Ok(c)
+    }
+
+    /// Sets the widths of the encoder (`d_model`, `d_fast`, `d_ctx`), the planner
+    /// (`d_state`, `d_action`, `d_hidden`) and the speech decoder (`d_model`, layers, heads,
+    /// pointer key width).
+    fn scale(
+        &mut self,
+        d_model: usize,
+        d_fast: usize,
+        d_ctx: usize,
+        (d_state, d_action, d_hidden): (usize, usize, usize),
+        (d_speech, layers, heads, copy): (usize, usize, usize, usize),
+    ) {
+        let t = &mut self.engine.ttt;
+        (t.d_model, t.d_fast, t.d_ctx) = (d_model, d_fast, d_ctx);
+        let j = &mut self.engine.jepa;
+        (j.d_state, j.d_action, j.d_hidden) = (d_state, d_action, d_hidden);
+        let s = &mut self.speech;
+        (s.d_model, s.n_layers, s.n_heads, s.copy_dim) = (d_speech, layers, heads, copy);
     }
 
     /// `key=value` lines (written next to a checkpoint as `<ckpt>.cfg`).

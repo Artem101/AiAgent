@@ -287,3 +287,204 @@ pub fn cmd_eval(a: &Args) -> Result<()> {
     }
     Ok(())
 }
+
+/// A page as text for the exported trajectories: `[role] text` per element.
+fn render_page(snap: &cog_engine::browser::PageSnapshot) -> String {
+    use cog_engine::browser::Role;
+    snap.elements
+        .iter()
+        .map(|e| {
+            let text = if e.role == Role::Input {
+                if e.value.is_empty() {
+                    "(пусто)".to_string()
+                } else {
+                    e.value.clone()
+                }
+            } else {
+                e.text.clone()
+            };
+            format!("[{}] {}", e.role.name(), text)
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+/// The teacher's reason for `action` (a THINK step of the exported trajectories).
+fn explain(spec: &cog_engine::browser::Spec, action: &Action) -> String {
+    use cog_engine::browser::goal::{Spec, TotalKind};
+    use cog_engine::browser::world::{Attr, ITEMS, UI_CATALOG, UI_FIND, UI_HOME, UI_NEXT};
+    let attr_name = |a: Attr| match a {
+        Attr::Price => "цену",
+        Attr::Color => "цвет",
+        Attr::Brand => "бренд",
+        Attr::Rating => "рейтинг",
+    };
+    match (action, spec) {
+        (Action::Type { text }, _) => format!("Ищу «{text}» через поиск магазина."),
+        (Action::Click { text, .. }, _) if text == UI_FIND => "Запрос введён — нажимаю «Найти».".into(),
+        (Action::Click { text, .. }, _) if text == UI_NEXT => {
+            "На этой странице каталога подходящего товара нет — листаю дальше.".into()
+        }
+        (Action::Click { text, .. }, _) if text == UI_CATALOG => "Искать по условию удобнее в каталоге.".into(),
+        (Action::Click { text, .. }, _) if text == UI_HOME => {
+            "Эта страница не для этой задачи — иду на главную.".into()
+        }
+        (Action::Click { text, .. }, Spec::Lookup { attr, .. }) => {
+            format!(
+                "В результатах нет нужного столбца — открываю страницу товара «{text}», там есть {}.",
+                attr_name(*attr)
+            )
+        }
+        (Action::Click { text, .. }, _) => format!("Открываю «{text}»."),
+        (Action::Back, _) => "Это не та страница — возвращаюсь назад.".into(),
+        (Action::Calc { text }, Spec::Total { kind, .. }) => format!(
+            "Обе цены видны на странице: {} — {}.",
+            text,
+            match kind {
+                TotalKind::Sum => "складываю",
+                _ => "из большей цены вычитаю меньшую",
+            }
+        ),
+        (Action::Calc { text }, _) => format!("Считаю на калькуляторе: {text}."),
+        (Action::Answer { .. }, Spec::Lookup { item, attr }) => {
+            format!("{} товара «{}» видна на странице — отвечаю.", attr_name(*attr), ITEMS[*item].nom)
+        }
+        (Action::Answer { .. }, Spec::Compare { a, b, .. }) => {
+            format!("Оба товара, «{}» и «{}», в результатах: сравниваю их значения.", ITEMS[*a].nom, ITEMS[*b].nom)
+        }
+        (Action::Answer { .. }, Spec::Filter(_)) => "В этой строке каталога товар подходит под условие.".into(),
+        (Action::Answer { .. }, Spec::Calc { .. } | Spec::Total { .. }) => {
+            "Калькулятор вернул результат — отвечаю.".into()
+        }
+        (Action::Answer { .. }, Spec::Chat(_)) => "Это реплика собеседника, искать ничего не нужно — отвечаю.".into(),
+    }
+}
+
+/// Browser trajectories of the teacher in the format of the school dataset
+/// (`scripts/build_school.py`): one JSON object per episode, a THINK step with the teacher's
+/// reason before every action, and every action with the page it was taken on.
+pub fn cmd_export(a: &Args) -> Result<()> {
+    use cog_engine::browser::expert;
+    use cog_engine::browser::obs::Note;
+    use cog_engine::browser::world::{home_url, World};
+    use cog_engine::browser::{Browser, Role, SimBrowser};
+    use cog_engine::tools::{Calculator, RustCalc};
+    use std::io::BufWriter;
+
+    let out = a.get("out", "data/school/browser.jsonl");
+    let n: usize = a.num("n", 20000)?;
+    let seed: u64 = a.num("seed", 1)?;
+    let mut w = BufWriter::new(std::fs::File::create(&out).map_err(candle_core::Error::wrap)?);
+    let mut sim = SimBrowser::new();
+    let origin = cog_engine::browser::sim::SIM_ORIGIN;
+    let mut total_steps = 0usize;
+    for (split, name, share) in [(Split::Train, "train", 0.9), (Split::HeldOut, "heldout", 0.1)] {
+        let k = (n as f64 * share) as usize;
+        for (i, (world, goal)) in browsing::sample_tasks(k, seed ^ (name.len() as u64), split).into_iter().enumerate() {
+            let spec = goal.spec.expect("sampled");
+            sim.goto(&home_url(origin, world))?;
+            let mut note: Option<Note> = None;
+            let mut steps = Vec::new();
+            for _ in 0..12 {
+                let snap = sim.snapshot()?;
+                let action = expert::act(&spec, &snap, note.as_ref());
+                steps.push(serde_json::json!({"act": "THINK", "text": explain(&spec, &action)}));
+                let mut step = serde_json::json!({
+                    "url": snap.url.strip_prefix(origin).unwrap_or(&snap.url),
+                    "page": render_page(&snap),
+                });
+                let (act, text) = match &action {
+                    Action::Click { role, text } => (format!("CLICK [{}]", role.name()), text.clone()),
+                    Action::Type { text } => ("TYPE".to_string(), text.clone()),
+                    Action::Back => ("BACK".to_string(), String::new()),
+                    Action::Calc { text } => ("CALC".to_string(), text.clone()),
+                    Action::Answer { text } => ("ANSWER".to_string(), text.clone()),
+                };
+                step["act"] = act.into();
+                step["text"] = text.into();
+                match &action {
+                    Action::Click { role, text } => {
+                        let id = snap.find(*role, text).expect("the teacher clicks what it sees");
+                        sim.click(id)?;
+                    }
+                    Action::Type { text } => sim.type_text(snap.first(Role::Input).expect("a text field"), text)?,
+                    Action::Back => sim.back()?,
+                    Action::Calc { text } => {
+                        let n = Note::of(text, &RustCalc.eval(text));
+                        step["result"] = n.result.clone().into();
+                        note = Some(n);
+                    }
+                    Action::Answer { .. } => {}
+                }
+                steps.push(step);
+                if matches!(action, Action::Answer { .. }) {
+                    break;
+                }
+            }
+            total_steps += steps.len();
+            let ex = serde_json::json!({
+                "id": format!("browser_{name}_{i:05}"),
+                "grade": serde_json::Value::Null,
+                "subject": "браузер",
+                "topic": spec.family().name(),
+                "split": name,
+                "world": world,
+                "question": goal.text,
+                "steps": steps,
+                "check": {"type": "text", "value": spec.expected(&World::new(world))},
+            });
+            writeln!(w, "{ex}").map_err(candle_core::Error::wrap)?;
+        }
+    }
+    w.flush().map_err(candle_core::Error::wrap)?;
+    println!("{out}: {n} teacher trajectories, {total_steps} steps");
+    Ok(())
+}
+
+/// Parameter counts of the unified presets, by module (for docs/scaling.md).
+pub fn cmd_params(a: &Args) -> Result<()> {
+    let names = a.get("presets", "base,m,l");
+    println!("{:<6} {:>12} {:>12} {:>12} {:>12} {:>12}", "preset", "TTT", "JEPA", "speech", "(embeddings)", "total");
+    for name in names.split(',') {
+        let model = UnifiedModel::new(UnifiedConfig::preset(name.trim())?, &Device::Cpu)?;
+        let mut by = std::collections::BTreeMap::<&str, usize>::new();
+        let mut emb = 0;
+        for v in model.online.names() {
+            let n = model.online.var(&v).map_or(0, |x| x.elem_count());
+            let module = if v.starts_with("ttt.") {
+                "ttt"
+            } else if v.starts_with("jepa.") {
+                "jepa"
+            } else {
+                "speech"
+            };
+            *by.entry(module).or_default() += n;
+            if v.ends_with("tok_emb") {
+                emb += n;
+            }
+        }
+        let c = &model.cfg;
+        println!(
+            "{:<6} {:>12} {:>12} {:>12} {:>12} {:>12}   TTT d={} fast={} ctx={} | JEPA s={} a={} h={} H={} | speech d={} L={} heads={} mlp={} copy={}",
+            name,
+            by["ttt"],
+            by["jepa"],
+            by["speech"],
+            emb,
+            model.num_params(),
+            c.engine.ttt.d_model,
+            c.engine.ttt.d_fast,
+            c.engine.ttt.d_ctx,
+            c.engine.jepa.d_state,
+            c.engine.jepa.d_action,
+            c.engine.jepa.d_hidden,
+            c.engine.jepa.horizon,
+            c.speech.d_model,
+            c.speech.n_layers,
+            c.speech.n_heads,
+            c.speech.mlp_ratio,
+            c.speech.copy_dim
+        );
+    }
+    Ok(())
+}

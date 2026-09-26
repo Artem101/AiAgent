@@ -29,6 +29,8 @@
 //! cog_engine chat  [--ckpt models/agent.safetensors] [--say "Привет!|Сколько стоит лампа?"] [--think]
 //!                  [--browser sim|chrome] [--temperature 0.7] [--search 1] [--world 42]
 //! cog_engine unified-eval [--ckpt models/agent.safetensors] [--n 256] [--grammar 300] [--episodes 200]
+//! cog_engine export-trajectories [--n 20000] [--out data/school/browser.jsonl]   (teacher episodes as JSONL chains)
+//! cog_engine unified-params [--presets base,m,l]                                  (parameters by module)
 //! (`agent` / `agent-eval` accept unified checkpoints as well)
 //! ```
 
@@ -823,9 +825,11 @@ fn main() -> Result<()> {
         "train-unified" => cli_unified::cmd_train(&a),
         "chat" => cli_unified::cmd_chat(&a),
         "unified-eval" => cli_unified::cmd_eval(&a),
+        "export-trajectories" => cli_unified::cmd_export(&a),
+        "unified-params" => cli_unified::cmd_params(&a),
         other => bail!(
             "unknown command '{other}' (demo | train | infer | bench | serve | agent | agent-eval | site | tokenizer | complete | \
-             text-eval | train-unified | chat | unified-eval)"
+             text-eval | train-unified | chat | unified-eval | export-trajectories | unified-params)"
         ),
     }
 }
