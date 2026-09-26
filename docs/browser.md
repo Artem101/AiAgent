@@ -28,15 +28,18 @@
 ```bash
 cargo build --release
 
-# спросить готовую модель (models/browser_agent.safetensors): агент откроет Chromium,
-# найдёт товары и ответит; для каждого шага печатается латентное рассуждение
-./target/release/cog_engine agent --ckpt models/browser_agent.safetensors --question "Что дешевле: лампа или стул?"
-./target/release/cog_engine agent --ckpt models/browser_agent.safetensors --question "Сколько будет 5+5?"
+# спросить готовую модель (models/agent.safetensors — единая модель, unified.md): агент откроет
+# Chromium, найдёт товары и ответит; для каждого шага печатается латентное рассуждение
+./target/release/cog_engine agent --question "Что дешевле: лампа или стул?"
+./target/release/cog_engine agent --question "Сколько будет 5+5?"
+# или поговорить с ним: каждая реплика — эпизод в браузере, разговор помнится
+./target/release/cog_engine chat --browser chrome
 
 # успешность на случайных задачах: обучающие и отложенные формулировки
-./target/release/cog_engine agent-eval --ckpt models/browser_agent.safetensors --browser chrome --episodes 100
+./target/release/cog_engine agent-eval --browser chrome --episodes 100
 
-# обучить свою модель (корпус: scripts/fetch_ru_corpus.sh), см. reasoning.md
+# обучить агента-браузера третьего шага (корпус: scripts/fetch_ru_corpus.sh), см. reasoning.md;
+# единая модель обучается командой train-unified (unified.md)
 RAYON_NUM_THREADS=1 ./target/release/cog_engine train --task browser --preset small --corpus data/ru/train.txt \
     --valid data/ru/valid.txt --text-mix 0.2 --steps 9000 --save-every 1000 --out agent.safetensors
 
@@ -183,8 +186,9 @@ Chromium ищется так: переменная `COG_CHROME`, затем Chro
 
 ## Результаты
 
-Поставляемая модель `models/browser_agent.safetensors` — `small` (2.05 млн параметров) с
-копированием, 9000 шагов на CPU. По 300 случайных задач (мир + вопрос) на каждом наборе
+Результаты агента третьего шага: `small` (2.05 млн параметров) с копированием, 9000 шагов на
+CPU (чекпойнт — в коммите `a32563f`; поставляемая теперь единая модель описана в
+[unified.md](unified.md)). По 300 случайных задач (мир + вопрос) на каждом наборе
 формулировок в симуляторе и 150 других задач в headless Chromium с настоящим `python3`:
 
 | Семейство | S, обучающие | S, отложенные | S в Chromium, обучающие | TD, обучающие | T0, обучающие |
@@ -211,7 +215,7 @@ use cog_engine::browser::{self, agent, goal, Chrome, EnginePolicy, Goal, SiteSer
 use cog_engine::{CogModel, CognitiveEngine};
 
 let model = CogModel::new(browser::engine_config("small")?, &candle_core::Device::Cpu)?;
-model.load("models/browser_agent.safetensors")?;
+model.load("agent.safetensors")?;   // чекпойнт `train --task browser`
 let mut policy = EnginePolicy::new(CognitiveEngine::from_model(&model)?).with_trace();
 
 let site = SiteServer::start("127.0.0.1:0")?;            // песочница

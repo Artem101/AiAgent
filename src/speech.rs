@@ -77,10 +77,25 @@ pub struct Sampling {
     pub top_k: usize,
     /// The first `greedy_prefix` tokens are always greedy (the verb and role of an action).
     pub greedy_prefix: usize,
+    /// Divides the probability of a word already said in this utterance (`1` = off). Only
+    /// word pieces (two letters or more) are penalised: digits and punctuation repeat freely.
+    pub repeat_penalty: f32,
 }
 
 impl Sampling {
-    pub const GREEDY: Self = Self { temperature: 0.0, top_k: 0, greedy_prefix: 0 };
+    pub const GREEDY: Self = Self { temperature: 0.0, top_k: 0, greedy_prefix: 0, repeat_penalty: 1.0 };
+}
+
+/// Which tokens are word pieces (at least two letters) — the ones [`Sampling::repeat_penalty`]
+/// applies to.
+fn word_pieces() -> &'static [bool] {
+    static W: std::sync::OnceLock<Vec<bool>> = std::sync::OnceLock::new();
+    W.get_or_init(|| {
+        let bpe = crate::text::ru();
+        (0..bpe.vocab_size() as u32)
+            .map(|t| String::from_utf8_lossy(bpe.piece(t)).chars().filter(|c| c.is_alphabetic()).count() >= 2)
+            .collect()
+    })
 }
 
 /// Per-example negative log-likelihood sums, token counts and the mean loss (see
@@ -381,6 +396,14 @@ impl SpeechDecoder {
                     continue;
                 }
                 dist[PAD as usize] = 0.0; // padding only ever follows <end>
+                if sampling.repeat_penalty > 1.0 && step >= sampling.greedy_prefix {
+                    let words = word_pieces();
+                    for &t in &said[r] {
+                        if words.get(t as usize).copied().unwrap_or(false) {
+                            dist[t as usize] /= sampling.repeat_penalty;
+                        }
+                    }
+                }
                 let greedy = sampling.temperature <= 0.0 || step < sampling.greedy_prefix;
                 let tok = if greedy { argmax(&dist) } else { sample(&dist, sampling, rng) };
                 logp[r] += dist[tok as usize].max(1e-30).ln();

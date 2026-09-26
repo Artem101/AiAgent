@@ -146,11 +146,13 @@ printf '3 1 4 1 5 9 2 6\n' | nc 127.0.0.1 7878
 ### `tokenizer`
 
 ```bash
-cog_engine tokenizer --corpus data/ru/train.txt [--vocab 1024] [--browser-texts 20000] [--out models/tokenizer_ru.bpe]
+cog_engine tokenizer --corpus data/ru20k/tokenizer_corpus.txt --vocab 8192 [--browser-texts 30000] [--out models/tokenizer_ru.bpe]
 ```
 
 Обучает байтовый BPE на корпусе и на текстах браузерной задачи (страницы, формулировки,
-тексты действий и результаты калькулятора), каждый текст — с ведущим пробелом. Файл
+тексты действий и результаты калькулятора), каждый текст — с ведущим пробелом. Поставляемый
+токенизатор (8192 токена) обучен на `data/ru20k/tokenizer_corpus.txt` — выборке «ru20k» и UD
+([unified.md](unified.md)); по умолчанию `--corpus` — `data/ru/train.txt`, `--vocab` — 1024. Файл
 `models/tokenizer_ru.bpe` компилируется в бинарник (`text::ru()`): после переобучения токенизатора
 пересоберите проект и обучите модели заново.
 
@@ -163,9 +165,68 @@ cog_engine complete --ckpt model.safetensors --text "Москва — столи
 Продолжение текста: следующие 16 BPE-токенов (все сразу, неавторегрессионно) для чекпойнта
 `text` или `browser` с корпусом.
 
+### `train-unified`
+
+Обучает единую модель — агента, который и разговаривает, и ищет, и считает ([unified.md](unified.md)).
+
+```bash
+cog_engine train-unified [--preset base|tiny] [--steps 20000] [--batch 32] [--lr 1e-3] [--min-lr 5e-5] [--warmup 300]
+                         [--out models/agent.safetensors] [--data data/ru20k|builtin] [--ud data/ru|none]
+                         [--save-every 500] [--eval-every N] [--log-every 50] [--seed 7]
+                         [--init ckpt [--start-step N]] [--d-model 256] [--layers 4] [--heads 4] [--copy 32] [--teacher-plan 0.3]
+```
+
+Данные — сборка «ru20k» (`scripts/fetch_ru20k.sh`, `scripts/build_ru20k.py`) и UD
+(`scripts/fetch_ru_corpus.sh`); `--data builtin` — несколько встроенных примеров для проверки
+без скачивания. Батч делится между ядрами (до 4 потоков). Лог каждые `--log-every` шагов —
+потери и точность самого вероятного токена по источникам:
+
+```
+step   2000 | loss 3.412 | nll 2.804 ptr 0.301 jepa 0.307 goal 0.003 | browser 0.08 (97%) dialogue 3.93 (37%) grammar 1.94 (63%) text 5.61 (22%) | |g| 1.02 | lr 9.62e-4 | 0.47 step/s
+```
+
+Каждые `--save-every` шагов пишется чекпойнт и `<ckpt>.cfg` (`kind=unified`), каждые
+`--eval-every` — потери на отложенных данных и несколько ответов.
+
+### `chat`
+
+Разговор с единой моделью. Каждая реплика — эпизод в браузере: модель может искать,
+считать или сразу ответить; предыдущие реплики входят в наблюдение.
+
+```bash
+cog_engine chat [--ckpt models/agent.safetensors] [--say "Привет!|Сколько стоит лампа?|Спасибо!"] [--think]
+                [--browser sim|chrome] [--calc python|rust] [--temperature 0.7] [--top-k 40] [--search 1] [--world 42] [--max-steps 12]
+```
+
+| Флаг | По умолчанию | Смысл |
+|---|---|---|
+| `--say` | нет | реплики через `\|` вместо чтения из stdin |
+| `--think` | нет | печатать рассуждение: дерево гипотез и что сказала бы каждая выжившая гипотеза |
+| `--temperature`, `--top-k` | 0.7, 40 | сэмплирование текста реплики (глагол и роль — всегда жадно); `0` — жадно |
+| `--search` | 1 | `0` — без латентного поиска (жадная цепочка мыслей) |
+| `--browser` | `sim` | `chrome` — настоящий Chromium |
+
+### `unified-eval`
+
+```bash
+cog_engine unified-eval [--ckpt models/agent.safetensors] [--n 256] [--grammar 300] [--dialogs 8] [--episodes 200]
+                        [--browser sim|chrome] [--search 1] [--temperature 0]
+```
+
+Печатает:
+
+- потери на отложенных данных по источникам (`--n` примеров на источник);
+- точность ответов на грамматические вопросы (`--grammar` вопросов об отложенных и об обучающих
+  леммах, по видам);
+- ответы на фиксированный набор реплик;
+- ответы на отложенные фрагменты диалогов рядом с настоящими;
+- успешность агента на `--episodes` задачах с обучающими и с отложенными формулировками.
+
 ### `agent`
 
-Задать вопрос агенту-браузеру (чекпойнт обучен с `--task browser`, см. [browser.md](browser.md)).
+Задать вопрос агенту. Команда принимает и единую модель (по умолчанию —
+`models/agent.safetensors`), и чекпойнт агента-браузера, обученный с `--task browser` (см.
+[browser.md](browser.md)).
 Вопрос — свободный текст на русском: модель читает его как есть. Арифметику агент считает
 калькулятором на Python ([calculator.md](calculator.md)).
 
@@ -177,7 +238,7 @@ cog_engine agent --ckpt agent.safetensors --question "Сколько будет 
 
 | Флаг | По умолчанию | Смысл |
 |---|---|---|
-| `--ckpt` | `models/browser_agent.safetensors` | чекпойнт агента (по умолчанию — поставляемая модель) |
+| `--ckpt` | `models/agent.safetensors` | чекпойнт агента (по умолчанию — поставляемая единая модель) |
 | `--question` | `Сколько стоит лампа?` | вопрос на русском; если он совпадает с одним из шаблонов (с точностью до регистра, «ё» и знаков) или это арифметический пример, ответ проверяется |
 | `--world` | 42 | номер мира песочницы (от него зависят все факты) |
 | `--browser` | `chrome` | `chrome` — настоящий Chromium, `sim` — симулятор |
@@ -230,6 +291,24 @@ horizon=4
 pools=0
 copy=0
 ```
+
+У единой модели (`train-unified`) свой формат:
+
+```
+kind=unified
+preset=base
+seed=7
+d_model=256
+layers=4
+heads=4
+mlp=4
+copy=32
+teacher_plan=0.3
+plan_noise=0.05
+```
+
+Остальное — TTT, JEPA, планировщик, размеры наблюдения и действия — берётся из пресета
+(`UnifiedConfig::preset`).
 
 Этих полей достаточно, чтобы воссоздать `EngineConfig` через `EngineConfig::preset`. Поля
 `conv`, `readout_last`, `probe`, `horizon`, `pools` и `copy` (`ttt.conv_width`, `ttt.readout_last`,

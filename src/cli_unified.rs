@@ -50,8 +50,12 @@ pub fn load_engine(a: &Args, ckpt: &str) -> Result<UnifiedEngine> {
     let model = UnifiedModel::load(ckpt, &Device::Cpu)?;
     let mut engine = UnifiedEngine::new(model)?;
     engine.search = a.num::<u8>("search", 1)? != 0;
-    engine.sampling =
-        Sampling { temperature: a.num("temperature", 0.0)?, top_k: a.num("top-k", 40)?, greedy_prefix: 2 };
+    engine.sampling = Sampling {
+        temperature: a.num("temperature", 0.0)?,
+        top_k: a.num("top-k", 40)?,
+        greedy_prefix: 2,
+        repeat_penalty: a.num("repeat-penalty", 1.0)?,
+    };
     engine.seed(a.num("seed", 1)?);
     Ok(engine)
 }
@@ -136,6 +140,7 @@ pub fn cmd_chat(a: &Args) -> Result<()> {
     let ckpt = a.get("ckpt", SHIPPED);
     let mut a2 = Args { cmd: a.cmd.clone(), opts: a.opts.clone() };
     a2.opts.entry("temperature".into()).or_insert_with(|| "0.7".into());
+    a2.opts.entry("repeat-penalty".into()).or_insert_with(|| "1.5".into());
     let mut policy = UnifiedPolicy::new(load_engine(&a2, &ckpt)?);
     if a.opts.contains_key("think") {
         policy = policy.with_trace();
@@ -245,7 +250,12 @@ pub fn cmd_eval(a: &Args) -> Result<()> {
         "Какое множественное число у слова «друг»?",
         "Как будет «читать» в прошедшем времени?",
     ];
-    engine.sampling = Sampling { temperature: a.num("temperature", 0.0)?, top_k: 40, greedy_prefix: 2 };
+    engine.sampling = Sampling {
+        temperature: a.num("temperature", 0.0)?,
+        top_k: 40,
+        greedy_prefix: 2,
+        repeat_penalty: a.num("repeat-penalty", 1.0)?,
+    };
     println!("replies (on the start page, no history):");
     for line in lines {
         let prompt = obs::encode_dialog(&cog_engine::browser::data::snapshot("/w/1/", None), &[], line, None);

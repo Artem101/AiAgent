@@ -604,6 +604,7 @@ impl UnifiedTrainer {
 pub fn validation(model: &UnifiedModel, data: &LanguageData, per_source: usize, seed: u64) -> Result<UnifiedReport> {
     let mut rng = Rng::stream(seed, 0x7A1D, 0);
     let mut total = UnifiedReport::empty();
+    let mut batches = 0;
     for source in Source::ALL {
         let mut left = per_source;
         while left > 0 {
@@ -612,10 +613,11 @@ pub fn validation(model: &UnifiedModel, data: &LanguageData, per_source: usize, 
             let batch = UnifiedBatch::new(&ex, model.device())?;
             let (_, r) = model.loss_with(&batch, &mut rng, 0.0, 0.0)?;
             total.accumulate(&r);
+            batches += 1;
             left -= k;
         }
     }
-    Ok(total)
+    Ok(total.scaled(1.0 / batches.max(1) as f32))
 }
 
 /// The latent reasoning of one decision.
@@ -700,7 +702,7 @@ impl UnifiedEngine {
     /// `k` sampled utterances (temperature `t`), most likely first.
     pub fn samples(&mut self, enc: &Encoded, thought: &Thought, k: usize, t: f32) -> Result<Vec<(Vec<u32>, f32)>> {
         let plans = thought.plan.repeat((k, 1, 1))?;
-        let s = Sampling { temperature: t, top_k: 40, greedy_prefix: 2 };
+        let s = Sampling { temperature: t, top_k: 40, greedy_prefix: 2, repeat_penalty: 1.0 };
         let mut out = self.model.speak(enc, &plans, s, &mut self.rng)?;
         out.sort_by(|a, b| b.1.total_cmp(&a.1));
         Ok(out)
