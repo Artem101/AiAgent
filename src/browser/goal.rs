@@ -4,11 +4,11 @@
 //!
 //! | family | example | answer |
 //! |---|---|---|
-//! | lookup — find an attribute | «Сколько стоит лампа?», «Кто производитель дрона?» | «Лампа стоит 12 ₽.», «Бренд дрона — Vega.» |
-//! | compare — read and compare two numbers | «Что дешевле: лампа или стул?» | «Стул дешевле.» |
+//! | lookup — find an attribute | «Сколько стоит лампа?», «Кто производитель дрона?» | «Сейчас лампа стоит 12 ₽.», «Бренд — Vega.» |
+//! | compare — read and compare two numbers | «Что дешевле: лампа или стул?» | «Дешевле стул.» |
 //! | filter — scan the catalogue for a condition | «Найди товар дешевле 5 ₽.», «Нужен красный товар.» | «Например, зонт.» (any matching product) |
 //! | calc — arithmetic with the calculator tool | «Сколько будет 5+5?», «Умножь 12 на 3.» | «5+5 = 10», «12 * 3 = 36» |
-//! | total — look prices up, then calculate | «Сколько стоят вместе лампа и стул?», «На сколько лампа дороже стула?» | «Вместе 19 ₽.», «Лампа дороже на 5 ₽.» |
+//! | total — look prices up, then calculate | «Сколько стоят вместе лампа и стул?», «На сколько лампа дороже стула?» | «Вместе 19 ₽.», «Дороже на 5 ₽.» |
 //! | chat — a few conversational phrases | «Привет!», «Спасибо», «Что ты умеешь?» | «Привет! Чем помочь?» |
 //!
 //! Every family has several templates with case forms (именительный, родительный,
@@ -312,7 +312,7 @@ impl Spec {
         }
     }
 
-    /// Whether `answer` is correct in `world`. The answer may be a sentence («Лампа стоит 12 ₽.»):
+    /// Whether `answer` is correct in `world`. The answer may be a sentence («Сейчас лампа стоит 12 ₽.»):
     /// the checker extracts what it states — its numbers, the products and values it names — and
     /// accepts it when that is exactly the right value (any matching product for a filter).
     pub fn accepts(&self, world: &World, answer: &str) -> bool {
@@ -330,7 +330,7 @@ impl Spec {
                     named == [world.brand[item]]
                 }
             },
-            // the product named first is the one the answer is about («Лампа дешевле стула.»)
+            // the product named first is the one the answer is about («Дешевле лампа.», «Лампа дешевле стула.»)
             Self::Compare { a, b, attr, most } => first_item(&words) == Some(Self::winner(world, a, b, attr, most)),
             Self::Filter(cond) => first_item(&words).is_some_and(|i| cond.holds(world, i)),
             Self::Calc { .. } | Self::Total { .. } => {
@@ -415,16 +415,12 @@ pub fn numbers(text: &str) -> Vec<String> {
     out
 }
 
-/// Sentences the teacher answers with. Every value is written as the page or the calculator
-/// shows it, so the model can copy it.
+/// Sentences the teacher answers with. Every value and every product name is written as the
+/// page, the question or the calculator shows it — lower-case, mid-sentence — so the model can
+/// copy it (a capitalised «Лампа» at the start of a sentence would be a different token).
 pub mod say {
     use super::super::world::{Attr, ITEMS};
     use super::TotalKind;
-
-    fn cap(s: &str) -> String {
-        let mut c = s.chars();
-        c.next().map_or(String::new(), |f| f.to_uppercase().chain(c).collect())
-    }
 
     /// `стоит` / `стоят` (plural-only nouns like «часы»).
     fn costs(item: usize) -> &'static str {
@@ -435,25 +431,24 @@ pub mod say {
         }
     }
 
-    /// «Лампа стоит 12 ₽.», «Цвет лампы — красный.», «Бренд лампы — Nova.», «Рейтинг лампы — 4 ★.»
+    /// «Сейчас лампа стоит 12 ₽.», «Цвет — красный.», «Бренд — Nova.», «Рейтинг — 4 ★.»
     pub fn lookup(item: usize, attr: Attr, shown: &str) -> String {
-        let it = ITEMS[item];
         match attr {
-            Attr::Price => format!("{} {} {shown}.", cap(it.nom), costs(item)),
-            Attr::Color => format!("Цвет {} — {shown}.", it.gen),
-            Attr::Brand => format!("Бренд {} — {shown}.", it.gen),
-            Attr::Rating => format!("Рейтинг {} — {shown}.", it.gen),
+            Attr::Price => format!("Сейчас {} {} {shown}.", ITEMS[item].nom, costs(item)),
+            Attr::Color => format!("Цвет — {shown}."),
+            Attr::Brand => format!("Бренд — {shown}."),
+            Attr::Rating => format!("Рейтинг — {shown}."),
         }
     }
 
-    /// «Лампа дешевле.», «Рейтинг выше у лампы.»
+    /// «Дешевле лампа.», «По рейтингу лучше лампа.»
     pub fn compare(winner: usize, attr: Attr, most: bool) -> String {
-        let it = ITEMS[winner];
+        let it = ITEMS[winner].nom;
         match (attr, most) {
-            (Attr::Rating, true) => format!("Рейтинг выше у {}.", it.gen),
-            (Attr::Rating, false) => format!("Рейтинг ниже у {}.", it.gen),
-            (_, true) => format!("{} дороже.", cap(it.nom)),
-            (_, false) => format!("{} дешевле.", cap(it.nom)),
+            (Attr::Rating, true) => format!("По рейтингу лучше {it}."),
+            (Attr::Rating, false) => format!("По рейтингу хуже {it}."),
+            (_, true) => format!("Дороже {it}."),
+            (_, false) => format!("Дешевле {it}."),
         }
     }
 
@@ -467,12 +462,12 @@ pub mod say {
         format!("{} = {result}", expr.trim())
     }
 
-    /// «Вместе 19 ₽.», «Лампа дороже на 5 ₽.», «Лампа дешевле на 5 ₽.»
-    pub fn total(kind: TotalKind, a: usize, result: &str) -> String {
+    /// «Вместе 19 ₽.», «Дороже на 5 ₽.», «Дешевле на 5 ₽.»
+    pub fn total(kind: TotalKind, result: &str) -> String {
         match kind {
             TotalKind::Sum => format!("Вместе {result} ₽."),
-            TotalKind::Pricier => format!("{} дороже на {result} ₽.", cap(ITEMS[a].nom)),
-            TotalKind::Cheaper => format!("{} дешевле на {result} ₽.", cap(ITEMS[a].nom)),
+            TotalKind::Pricier => format!("Дороже на {result} ₽."),
+            TotalKind::Cheaper => format!("Дешевле на {result} ₽."),
         }
     }
 }
@@ -765,7 +760,10 @@ fn lower_first(s: &str) -> String {
     c.next().map_or(String::new(), |f| f.to_lowercase().chain(c).collect())
 }
 
-/// Random surface variation: lower-case start, dropped final punctuation, «пожалуйста».
+/// Random surface variation: lower-case start, dropped final punctuation, «пожалуйста», and
+/// letter case — product names written with a capital («Сколько стоит Лампа?»), a short line in
+/// capitals or a line in lower case — so the model learns that «Лампа», «ЛАМПА» and «лампа» (different
+/// tokens) are one word.
 fn perturb(rng: &mut Rng, text: String, chat: bool) -> String {
     let mut t = text;
     if !chat && rng.uniform() < 0.1 {
@@ -777,7 +775,43 @@ fn perturb(rng: &mut Rng, text: String, chat: bool) -> String {
     if rng.uniform() < 0.2 {
         t = t.trim_end_matches(['?', '.', '!']).to_string();
     }
+    match rng.uniform() {
+        x if x < 0.12 => t = capitalize_items(&t),
+        // capitals take ~2 tokens a letter: only short lines are shouted
+        x if x < 0.16 && t.chars().count() <= 24 => t = t.to_uppercase(),
+        x if x < 0.20 => t = t.to_lowercase(),
+        _ => {}
+    }
     t
+}
+
+/// Every product name (any case form) with a capital first letter.
+fn capitalize_items(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut word = String::new();
+    let flush = |word: &mut String, out: &mut String| {
+        let lower = word.to_lowercase();
+        if ITEMS.iter().any(|it| [it.nom, it.gen, it.acc].contains(&lower.as_str())) {
+            let mut c = word.chars();
+            if let Some(f) = c.next() {
+                out.extend(f.to_uppercase());
+                out.push_str(c.as_str());
+            }
+        } else {
+            out.push_str(word);
+        }
+        word.clear();
+    };
+    for ch in text.chars() {
+        if ch.is_alphabetic() {
+            word.push(ch);
+        } else {
+            flush(&mut word, &mut out);
+            out.push(ch);
+        }
+    }
+    flush(&mut word, &mut out);
+    out
 }
 
 /// A random operand: mostly small, sometimes up to three digits.
@@ -1040,6 +1074,21 @@ mod tests {
     }
 
     #[test]
+    fn letter_case_varies_but_questions_stay_recognisable() {
+        assert_eq!(capitalize_items("Что дешевле: лампа или стула?"), "Что дешевле: Лампа или Стула?");
+        let mut rng = Rng::new(8);
+        let world = World::new(3);
+        let (mut caps, mut upper) = (0, 0);
+        for _ in 0..2000 {
+            let g = sample(&mut rng, &world, Family::Lookup, Split::Train);
+            caps += g.text.contains(|c: char| c.is_uppercase()) as usize;
+            upper += (g.text == g.text.to_uppercase()) as usize;
+            assert_eq!(recognize(&g.text), g.spec, "{}", g.text);
+        }
+        assert!(upper > 10 && caps > upper, "{caps} {upper}");
+    }
+
+    #[test]
     fn sentence_answers_are_checked_by_what_they_state() {
         let w = World::new(5);
         let p = w.price[0];
@@ -1063,7 +1112,7 @@ mod tests {
         assert!(sub.accepts(&w, "100 - 250 = -150") && !sub.accepts(&w, "100 - 250 = 150"));
         let total = Spec::Total { a: 0, b: 1, kind: TotalKind::Sum };
         let sum = (w.price[0] + w.price[1]).to_string();
-        assert!(total.accepts(&w, &say::total(TotalKind::Sum, 0, &sum)));
+        assert!(total.accepts(&w, &say::total(TotalKind::Sum, &sum)));
         assert_eq!(numbers("Вместе 2,5 ₽ и -3"), ["2.5", "-3"]);
     }
 

@@ -1,12 +1,12 @@
 //! Scripted teacher: the next action from the page snapshot and the structured goal.
 //!
 //! ```text
-//! lookup  product page of the item          → ANSWER «Лампа стоит 12 ₽.» (the attribute row, in a sentence)
+//! lookup  product page of the item          → ANSWER «Сейчас лампа стоит 12 ₽.» (the attribute row, in a sentence)
 //!         value visible in a results / catalogue row → ANSWER it (price, rating / price, color)
 //!         item among the links              → CLICK [link] <item>
 //!         search box holds the item         → CLICK [button] Найти
 //!         a search box                      → TYPE <item>
-//! compare both products listed with values  → ANSWER «Стул дешевле.» (cheaper / pricier / better / worse)
+//! compare both products listed with values  → ANSWER «Дешевле стул.» (cheaper / pricier / better / worse)
 //!         search box holds «a b»            → CLICK [button] Найти
 //!         a search box                      → TYPE «a b»
 //! filter  a catalogue row matches           → ANSWER «Например, стул.»
@@ -14,7 +14,7 @@
 //!         search page                       → CLICK [link] Каталог
 //! calc    the tool result is for the expression → ANSWER «12 * 3 = 36» (the calculator's line)
 //!         otherwise                         → CALC <expression as written in the question>
-//! total   both prices listed, result known  → ANSWER «Вместе 19 ₽.» / «Лампа дороже на 5 ₽.»
+//! total   both prices listed, result known  → ANSWER «Вместе 19 ₽.» / «Дороже на 5 ₽.»
 //!         both prices listed                → CALC «price a + price b» (or the difference)
 //!         otherwise                         → search «a b», as for compare
 //! chat                                      → ANSWER <the canonical reply> (training data: any of the replies)
@@ -166,7 +166,7 @@ pub fn act(spec: &Spec, snap: &PageSnapshot, note: Option<&Note>) -> Action {
                     let price = |i: usize| view.row(i).and_then(|v| v.first().copied()).and_then(parse_number);
                     match (price(a), price(b)) {
                         (Some(x), Some(y)) => {
-                            calculate(Spec::total_expr(kind, x, y), note, |n| say::total(kind, a, &n.result))
+                            calculate(Spec::total_expr(kind, x, y), note, |n| say::total(kind, &n.result))
                         }
                         _ => search(&view, &query),
                     }

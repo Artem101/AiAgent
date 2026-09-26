@@ -3,7 +3,7 @@
 //!
 //! | source | share | observation | action |
 //! |---|---|---|---|
-//! | browser | 35% | page + (sometimes unrelated earlier turns) + task + tool result | the teacher's `CLICK` / `TYPE` / `BACK` / `CALC` / `ANSWER «Лампа стоит 12 ₽.»` |
+//! | browser | 35% | page + (sometimes unrelated earlier turns) + task + tool result | the teacher's `CLICK` / `TYPE` / `BACK` / `CALC` / `ANSWER «Сейчас лампа стоит 12 ₽.»` |
 //! | dialogue | 35% | a shop page + the earlier turns + the user's line | `ANSWER` + the reply from fiction or a joke |
 //! | grammar | 15% | a shop page + a question about a word | `ANSWER` + its form(s): «Как будет «стол» во множественном числе?» → «столы» |
 //! | text | 15% | `<text>` + the start of a sentence | its continuation (no verb) |
@@ -241,6 +241,30 @@ fn stray_history(rng: &mut Rng, dialogs: &[Dialog]) -> Vec<Turn> {
         .collect()
 }
 
+/// A user's line as people type it: now and then all in lower case or (a short one) in capitals.
+fn vary_case(rng: &mut Rng, line: String) -> String {
+    match rng.uniform() {
+        x if x < 0.08 => line.to_lowercase(),
+        x if x < 0.11 && line.chars().count() <= 30 => line.to_uppercase(),
+        _ => line,
+    }
+}
+
+/// The first letter inside «…» in upper case: «книга» → «Книга».
+pub fn capitalize_quoted(text: &str) -> String {
+    match text.find('«') {
+        Some(i) => {
+            let (head, tail) = text.split_at(i + '«'.len_utf8());
+            let mut c = tail.chars();
+            match c.next() {
+                Some(f) => format!("{head}{}{}", f.to_uppercase(), c.as_str()),
+                None => text.to_string(),
+            }
+        }
+        None => text.to_string(),
+    }
+}
+
 fn answer_tokens(text: &str) -> Option<[u32; ACTION_LEN]> {
     Action::Answer { text: text.to_string() }.encode(text::ru())
 }
@@ -287,14 +311,18 @@ pub fn example(rng: &mut Rng, data: &LanguageData, source: Source, split: Split)
             Source::Dialog => {
                 let d = &dialogs[rng.below(dialogs.len())];
                 let (history, line) = dialog_turns(&d.turns);
+                let line = vary_case(rng, line);
                 answer_tokens(&d.reply).map(|a| (obs::encode_dialog(&background_page(rng), &history, &line, None), a))
             }
             Source::Grammar => {
                 let qs = if held { &data.questions_heldout } else { &data.questions };
                 let q = &qs[rng.below(qs.len())];
                 let history = if rng.uniform() < 0.3 { stray_history(rng, dialogs) } else { Vec::new() };
+                // the word asked about is sometimes capitalised («Книга»); its forms stay lower-case
+                let question = if rng.uniform() < 0.2 { capitalize_quoted(&q.question) } else { q.question.clone() };
+                let question = vary_case(rng, question);
                 answer_tokens(&q.answer)
-                    .map(|a| (obs::encode_dialog(&background_page(rng), &history, &q.question, None), a))
+                    .map(|a| (obs::encode_dialog(&background_page(rng), &history, &question, None), a))
             }
             Source::Text => {
                 let ss = if held { &data.sentences_valid } else { &data.sentences };
@@ -350,6 +378,7 @@ mod tests {
         assert_eq!(h, vec![Turn::user("Привет!"), Turn::bot("Привет! Как дела?")]);
         let t = obs::history_tokens(&h, text::ru());
         assert_eq!((t[0], t.iter().filter(|&&x| x == BOT).count()), (USER, 1));
+        assert_eq!(capitalize_quoted("Какого рода слово «книга»?"), "Какого рода слово «Книга»?");
     }
 
     #[test]
