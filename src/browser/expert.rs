@@ -231,3 +231,55 @@ pub fn act(spec: &Spec, snap: &PageSnapshot, note: Option<&Note>) -> Action {
         },
     }
 }
+
+/// The teacher's reason for `action`: the `THINK` step it takes before it (in the second
+/// observation format and in the exported trajectories).
+pub fn explain(spec: &Spec, action: &Action) -> String {
+    use super::goal::TotalKind;
+    let attr_name = |a: Attr| match a {
+        Attr::Price => "цену",
+        Attr::Color => "цвет",
+        Attr::Brand => "бренд",
+        Attr::Rating => "рейтинг",
+    };
+    match (action, spec) {
+        (Action::Type { text }, _) => format!("Ищу «{text}» через поиск магазина."),
+        (Action::Click { text, .. }, _) if text == UI_FIND => "Запрос введён — нажимаю «Найти».".into(),
+        (Action::Click { text, .. }, _) if text == UI_NEXT => {
+            "На этой странице каталога подходящего товара нет — листаю дальше.".into()
+        }
+        (Action::Click { text, .. }, _) if text == UI_CATALOG => "Искать по условию удобнее в каталоге.".into(),
+        (Action::Click { text, .. }, _) if text == UI_HOME => {
+            "Эта страница не для этой задачи — иду на главную.".into()
+        }
+        (Action::Click { text, .. }, Spec::Lookup { attr, .. }) => {
+            format!(
+                "В результатах нет нужного столбца — открываю страницу товара «{text}», там есть {}.",
+                attr_name(*attr)
+            )
+        }
+        (Action::Click { text, .. }, _) => format!("Открываю «{text}»."),
+        (Action::Back, _) => "Это не та страница — возвращаюсь назад.".into(),
+        (Action::Calc { text }, Spec::Total { kind, .. }) => format!(
+            "Обе цены видны на странице: {} — {}.",
+            text,
+            match kind {
+                TotalKind::Sum => "складываю",
+                _ => "из большей цены вычитаю меньшую",
+            }
+        ),
+        (Action::Calc { text }, _) => format!("Считаю на калькуляторе: {text}."),
+        (Action::Answer { .. }, Spec::Lookup { item, attr }) => {
+            format!("{} товара «{}» видна на странице — отвечаю.", attr_name(*attr), ITEMS[*item].nom)
+        }
+        (Action::Answer { .. }, Spec::Compare { a, b, .. }) => {
+            format!("Оба товара, «{}» и «{}», в результатах: сравниваю их значения.", ITEMS[*a].nom, ITEMS[*b].nom)
+        }
+        (Action::Answer { .. }, Spec::Filter(_)) => "В этой строке каталога товар подходит под условие.".into(),
+        (Action::Answer { .. }, Spec::Calc { .. } | Spec::Total { .. }) => {
+            "Калькулятор вернул результат — отвечаю.".into()
+        }
+        (Action::Answer { .. }, Spec::Chat(_)) => "Это реплика собеседника, искать ничего не нужно — отвечаю.".into(),
+        (Action::Think { text } | Action::Lookup { text }, _) => text.clone(),
+    }
+}

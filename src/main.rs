@@ -26,9 +26,12 @@
 //! cog_engine train-unified [--preset base|tiny] [--steps 20000] [--batch 32] [--lr 1e-3] [--out models/agent.safetensors]
 //!                  [--data data/ru20k|builtin] [--ud data/ru|none] [--save-every 500] [--eval-every N]
 //!                  [--init ckpt [--start-step N]] [--d-model 256] [--layers 4] [--heads 4] [--copy 32]
+//!                  [--preset m|l|tiny2] [--grow-from base.safetensors [--layout v2] [--grow-noise 1e-3]]
+//!                  [--school data/school/chains.jsonl]   (school reasoning chains; scratchpad format only)
 //! cog_engine chat  [--ckpt models/agent.safetensors] [--say "Привет!|Сколько стоит лампа?"] [--think]
 //!                  [--browser sim|chrome] [--temperature 0.7] [--search 1] [--world 42]
 //! cog_engine unified-eval [--ckpt models/agent.safetensors] [--n 256] [--grammar 300] [--episodes 200]
+//!                  [--school data/school/chains.jsonl --school-n 300]
 //! cog_engine export-trajectories [--n 20000] [--out data/school/browser.jsonl]   (teacher episodes as JSONL chains)
 //! cog_engine unified-params [--presets base,m,l]                                  (parameters by module)
 //! (`agent` / `agent-eval` accept unified checkpoints as well)

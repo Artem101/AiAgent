@@ -49,6 +49,8 @@ pub struct CopyHead {
     pub gate: Lin,
     /// Token ids below this are never copied (special tokens).
     pub min_token: u32,
+    /// …nor ids from this one on (specials appended after the merges, see `text::EXTRAS`).
+    pub max_token: u32,
     /// Point only at copyable positions (the fresh softmax masks the others) instead of
     /// dropping the mass that lands on them.
     pub mask_specials: bool,
@@ -72,12 +74,27 @@ impl CopyHead {
             query: ps.linear(&format!("{prefix}_query"), d_token, d_key, false)?,
             gate: ps.linear(&format!("{prefix}_gate"), d_token, 2, true)?,
             min_token,
+            max_token: u32::MAX,
             mask_specials: false,
         })
     }
 
     pub fn d_key(&self) -> usize {
         self.query.d_out()
+    }
+
+    /// Whether a token id can be copied.
+    pub fn copyable(&self, tok: u32) -> bool {
+        tok >= self.min_token && tok < self.max_token
+    }
+
+    /// `1.0` where `context: [M, N]` holds a token that is never copied, `0.0` elsewhere (f32).
+    fn not_copyable(&self, context: &Tensor) -> Result<Tensor> {
+        let low = context.lt(self.min_token)?.to_dtype(DType::F32)?;
+        if self.max_token == u32::MAX {
+            return Ok(low);
+        }
+        low + context.ge(self.max_token)?.to_dtype(DType::F32)?
     }
 
     /// Pointer distributions `p_l`, `[M, L, N]`, and the copy-gate logits `[M, L]`, for probe
@@ -94,7 +111,7 @@ impl CopyHead {
         let q = self.query.forward(emb)?;
         let mut scores = (q.matmul(&keys.transpose(1, 2)?.contiguous()?)? / (self.d_key() as f64).sqrt())?;
         if let (true, Some(ctx)) = (self.mask_specials, context) {
-            let special = ctx.lt(self.min_token)?.to_dtype(scores.dtype())?.affine(crate::nn::MASKED as f64, 0.0)?;
+            let special = self.not_copyable(ctx)?.to_dtype(scores.dtype())?.affine(crate::nn::MASKED as f64, 0.0)?;
             scores = scores.broadcast_add(&special.unsqueeze(1)?)?;
         }
         let fresh = candle_nn::ops::softmax(&scores, D::Minus1)?; // not `softmax_last_dim`: no backward
@@ -128,7 +145,7 @@ impl CopyHead {
         let q = self.query.forward(emb)?;
         let mut scores = (q.matmul(&keys.transpose(1, 2)?.contiguous()?)? / (self.d_key() as f64).sqrt())?;
         if let (true, Some(ctx)) = (self.mask_specials, context) {
-            let special = ctx.lt(self.min_token)?.to_dtype(scores.dtype())?.affine(crate::nn::MASKED as f64, 0.0)?;
+            let special = self.not_copyable(ctx)?.to_dtype(scores.dtype())?.affine(crate::nn::MASKED as f64, 0.0)?;
             scores = scores.broadcast_add(&special.unsqueeze(1)?)?;
         }
         let fresh = candle_nn::ops::softmax(&scores, D::Minus1)?.squeeze(1)?; // [M, N]
@@ -162,7 +179,7 @@ impl CopyHead {
         let (p, copy_logit) = self.pointer_over(emb, keys, Some(context))?;
         let (p, copy_logit) = (p.to_dtype(DType::F32)?, copy_logit.to_dtype(DType::F32)?);
         // pointer mass on (copyable) positions holding the target token
-        let copyable = context.ge(self.min_token)?.to_dtype(DType::F32)?.unsqueeze(1)?; // [M, 1, N]
+        let copyable = (self.not_copyable(context)?.neg()? + 1.0)?.unsqueeze(1)?; // [M, 1, N]
         let hits = context
             .unsqueeze(1)?
             .broadcast_as((m, l, n))?
@@ -184,8 +201,8 @@ impl CopyHead {
     }
 
     pub fn pack(&self, dtype: DType) -> Result<PackedCopyHead> {
-        if self.mask_specials {
-            candle_core::bail!("the packed copy head does not mask specials")
+        if self.mask_specials || self.max_token != u32::MAX {
+            candle_core::bail!("the packed copy head supports neither masked specials nor a token range")
         }
         Ok(PackedCopyHead { query: self.query.pack(dtype)?, gate: self.gate.pack(dtype)?, min_token: self.min_token })
     }

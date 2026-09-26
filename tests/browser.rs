@@ -37,7 +37,7 @@ fn apply(browser: &mut dyn Browser, snap: &PageSnapshot, action: &Action, note: 
             *note = Some(Note::of(text, &RustCalc.eval(text)));
             Ok(())
         }
-        Action::Answer { .. } => Ok(()),
+        Action::Answer { .. } | Action::Think { .. } | Action::Lookup { .. } => Ok(()),
     }
 }
 

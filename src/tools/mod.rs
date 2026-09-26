@@ -1,12 +1,14 @@
 //! Tools the agent can call.
 //!
 //! * [`calc`] — exact arithmetic (`+ - * /`, parentheses, decimals) with Python semantics;
-//! * [`python`] — the same calculator executed by a sandboxed `python3` worker.
+//! * [`python`] — the same calculator executed by a sandboxed `python3` worker;
+//! * [`dictionary`] — the morphological dictionary of `LOOKUP «слово»`.
 //!
 //! The browsing agent calls the calculator with the action `CALC «12+30»`; the answer comes
 //! back in its next observation (`CALC 1·2·+·3·0 = 4·2`, see [`crate::browser::obs`]).
 
 pub mod calc;
+pub mod dictionary;
 pub mod python;
 
 pub use calc::CalcError;

@@ -39,10 +39,10 @@ use candle_core::{bail, DType, Device, Result, Tensor, Var};
 use candle_nn::{AdamW, Optimizer, ParamsAdamW};
 
 use crate::arena::Arena;
-use crate::browser::action::{Action, ACTION_LEN};
+use crate::browser::action::Action;
 use crate::browser::agent::Policy;
 use crate::browser::goal::{Goal, Split};
-use crate::browser::obs::{Note, OBS_LEN};
+use crate::browser::obs::{Layout, Note};
 use crate::browser::{self, PageSnapshot};
 use crate::config::{EngineConfig, PlannerKind};
 use crate::dialog::{self, Example, LanguageData, Source};
@@ -70,19 +70,26 @@ pub struct UnifiedConfig {
     pub teacher_plan: f64,
     /// Std of the noise added to the plan the decoder sees.
     pub plan_noise: f64,
+    /// Observation format (V1: the shipped model; V2: scratchpad, docs/scaling.md).
+    pub layout: Layout,
+    /// Multiplies the decoder's vocabulary logits (1, or ½ after a width doubling).
+    pub logit_scale: f64,
 }
 
 impl UnifiedConfig {
     /// `tiny` (tests, ~1 M parameters), `base` (the shipped model, 7.7 M), and the scaled-up
     /// `m` (~14 M) and `l` (~24 M) of docs/scaling.md.
     pub fn preset(name: &str) -> Result<Self> {
-        let vocab = text::ru().vocab_size();
-        let base = match name {
-            "tiny" => false,
-            "base" | "m" | "l" => true,
-            other => bail!("unknown unified preset '{other}' (tiny | base | m | l)"),
+        let (base, layout) = match name {
+            "tiny" => (false, Layout::V1),
+            "tiny2" => (false, Layout::V2),
+            "base" => (true, Layout::V1),
+            "m" | "l" => (true, Layout::V2),
+            other => bail!("unknown unified preset '{other}' (tiny | tiny2 | base | m | l)"),
         };
-        let mut e = EngineConfig::preset(if base { "small" } else { "tiny" }, vocab, OBS_LEN, ACTION_LEN)?;
+        // the V1 models predate the appended THINK / LOOKUP tokens
+        let vocab = if layout.scratchpad { text::ru().vocab_size() } else { text::BASE_VOCAB };
+        let mut e = EngineConfig::preset(if base { "small" } else { "tiny" }, vocab, layout.len, layout.action_len)?;
         e.ttt.conv_width = browser::CONV_WIDTH;
         e.ttt.readout_last = browser::READOUT_LAST;
         e.ttt.readout_pools = browser::READOUT_POOLS;
@@ -93,15 +100,26 @@ impl UnifiedConfig {
         e.planner.tree_beam = browser::TREE_BEAM;
         e.planner.tree_branch = browser::TREE_BRANCH;
         e.planner.kind = PlannerKind::Mppi;
+        let l = layout.action_len;
         let speech = if base {
-            SpeechConfig { d_model: 256, n_layers: 4, n_heads: 4, mlp_ratio: 4, max_len: ACTION_LEN, copy_dim: 32 }
+            SpeechConfig { d_model: 256, n_layers: 4, n_heads: 4, mlp_ratio: 4, max_len: l, copy_dim: 32 }
         } else {
-            SpeechConfig { d_model: 64, n_layers: 2, n_heads: 4, mlp_ratio: 2, max_len: ACTION_LEN, copy_dim: 16 }
+            SpeechConfig { d_model: 64, n_layers: 2, n_heads: 4, mlp_ratio: 2, max_len: l, copy_dim: 16 }
         };
-        let mut c = Self { preset: name.to_string(), engine: e, speech, teacher_plan: 0.3, plan_noise: 0.05 };
+        let mut c = Self {
+            preset: name.to_string(),
+            engine: e,
+            speech,
+            teacher_plan: 0.3,
+            plan_noise: 0.05,
+            layout,
+            logit_scale: 1.0,
+        };
         match name {
             "m" => c.scale(160, 96, 256, (96, 24, 384), (320, 6, 5, 48)),
-            "l" => c.scale(256, 128, 320, (128, 32, 512), (512, 4, 8, 64)),
+            // «base» with the planner and the decoder twice as wide: grown from it without loss
+            // (see `UnifiedModel::grow`), the encoder keeps its width
+            "l" => c.scale(128, 64, 192, (128, 32, 512), (512, 4, 8, 32)),
             _ => {}
         }
         Ok(c)
@@ -130,8 +148,19 @@ impl UnifiedConfig {
     pub fn to_text(&self, seed: u64) -> String {
         let s = &self.speech;
         format!(
-            "kind=unified\npreset={}\nseed={seed}\nd_model={}\nlayers={}\nheads={}\nmlp={}\ncopy={}\nteacher_plan={}\nplan_noise={}\n",
-            self.preset, s.d_model, s.n_layers, s.n_heads, s.mlp_ratio, s.copy_dim, self.teacher_plan, self.plan_noise
+            "kind=unified\npreset={}\nseed={seed}\nd_model={}\nlayers={}\nheads={}\nmlp={}\ncopy={}\nteacher_plan={}\nplan_noise={}\n\
+             layout={}\nvocab={}\nlogit_scale={}\n",
+            self.preset,
+            s.d_model,
+            s.n_layers,
+            s.n_heads,
+            s.mlp_ratio,
+            s.copy_dim,
+            self.teacher_plan,
+            self.plan_noise,
+            self.layout.name(),
+            self.engine.vocab_size,
+            self.logit_scale
         )
     }
 
@@ -153,7 +182,25 @@ impl UnifiedConfig {
         c.speech.copy_dim = num("copy")?;
         c.teacher_plan = float("teacher_plan")?;
         c.plan_noise = float("plan_noise")?;
+        // absent in the first checkpoints (V1, 8192 tokens)
+        if kv.contains_key("layout") {
+            c.set_layout(Layout::parse(get("layout")?)?);
+        }
+        if kv.contains_key("vocab") {
+            c.engine.vocab_size = num("vocab")?;
+        }
+        if kv.contains_key("logit_scale") {
+            c.logit_scale = float("logit_scale")?;
+        }
         Ok(c)
+    }
+
+    /// Switches the observation format (observation and action lengths follow).
+    pub fn set_layout(&mut self, layout: Layout) {
+        self.layout = layout;
+        self.engine.max_prompt_len = layout.len;
+        self.engine.flow.seq_len = layout.action_len;
+        self.speech.max_len = layout.action_len;
     }
 
     pub fn prompt_len(&self) -> usize {
@@ -177,11 +224,12 @@ pub struct UnifiedBatch {
 impl UnifiedBatch {
     pub fn new(examples: &[Example], device: &Device) -> Result<Self> {
         let b = examples.len();
-        let prompt: Vec<u32> = examples.iter().flat_map(|e| e.prompt).collect();
-        let answer: Vec<u32> = examples.iter().flat_map(|e| e.answer).collect();
+        let (n, l) = (examples[0].prompt.len(), examples[0].answer.len());
+        let prompt: Vec<u32> = examples.iter().flat_map(|e| e.prompt.iter().copied()).collect();
+        let answer: Vec<u32> = examples.iter().flat_map(|e| e.answer.iter().copied()).collect();
         Ok(Self {
-            prompt: Tensor::from_vec(prompt, (b, OBS_LEN), device)?,
-            answer: Tensor::from_vec(answer, (b, ACTION_LEN), device)?,
+            prompt: Tensor::from_vec(prompt, (b, n), device)?,
+            answer: Tensor::from_vec(answer, (b, l), device)?,
             sources: examples.iter().map(|e| e.source).collect(),
         })
     }
@@ -300,7 +348,7 @@ impl UnifiedModel {
         tcfg.jepa.copy_dim = cfg.speech.copy_dim;
         let ttt = TttEncoder::new(&mut online, &tcfg)?;
         let jepa = Jepa::new(&mut online, &mut target, &cfg.engine)?;
-        let speech = SpeechDecoder::new(
+        let mut speech = SpeechDecoder::new(
             &mut online,
             &cfg.speech,
             cfg.engine.vocab_size,
@@ -309,6 +357,7 @@ impl UnifiedModel {
             ttt.d_features(),
             cfg.engine.jepa.copy_min_token,
         )?;
+        speech.logit_scale = cfg.logit_scale;
         Ok(Self { cfg, online, target, ttt, jepa, speech, device: device.clone() })
     }
 
@@ -475,6 +524,9 @@ pub struct UnifiedTrainConfig {
     /// Threads the batch is split across (data parallelism within a step: candle runs
     /// element-wise ops on one core, so micro-batches on several cores add up).
     pub workers: usize,
+    /// School grades by training progress: 1–3 for the first 20% of the steps, 1–5 up to 50%,
+    /// then all.
+    pub curriculum: bool,
 }
 
 impl Default for UnifiedTrainConfig {
@@ -489,6 +541,7 @@ impl Default for UnifiedTrainConfig {
             grad_clip: 1.0,
             log_every: 50,
             workers: std::thread::available_parallelism().map_or(1, |n| n.get()).min(4),
+            curriculum: true,
         }
     }
 }
@@ -536,7 +589,19 @@ impl UnifiedTrainer {
     /// One optimisation step on a fresh mixed batch; returns the report and the gradient norm.
     /// The batch is split into `workers` micro-batches whose gradients are averaged.
     pub fn train_step(&mut self) -> Result<(UnifiedReport, f32)> {
-        let examples = dialog::mixed(&mut self.rng, &self.data, self.tc.batch_size, Split::Train);
+        if self.tc.curriculum {
+            // school grades 1–3 first, then 1–5, then all (docs/scaling.md)
+            let p = self.step as f64 / self.tc.steps.max(1) as f64;
+            self.data.max_grade = if p < 0.2 {
+                3
+            } else if p < 0.5 {
+                5
+            } else {
+                0
+            };
+        }
+        let layout = self.model.cfg.layout;
+        let examples = dialog::mixed(&mut self.rng, &self.data, self.tc.batch_size, Split::Train, &layout);
         let k = self.tc.workers.clamp(1, examples.len());
         let chunks: Vec<&[Example]> = examples.chunks(examples.len().div_ceil(k)).collect();
         let seeds: Vec<u64> = chunks.iter().map(|_| self.rng.below(1 << 30) as u64).collect();
@@ -635,7 +700,9 @@ pub fn validation(model: &UnifiedModel, data: &LanguageData, per_source: usize, 
         let mut left = per_source;
         while left > 0 {
             let k = left.min(32);
-            let ex: Vec<Example> = (0..k).map(|_| dialog::example(&mut rng, data, source, Split::HeldOut)).collect();
+            let layout = model.cfg.layout;
+            let ex: Vec<Example> =
+                (0..k).map(|_| dialog::example(&mut rng, data, source, Split::HeldOut, &layout)).collect();
             let batch = UnifiedBatch::new(&ex, model.device())?;
             let (_, r) = model.loss_with(&batch, &mut rng, 0.0, 0.0)?;
             total.accumulate(&r);
@@ -808,6 +875,10 @@ impl Policy for UnifiedPolicy {
     fn last_reasoning(&self) -> Option<Reasoning> {
         self.reasoning.clone()
     }
+
+    fn layout(&self) -> Layout {
+        self.engine.model.cfg.layout
+    }
 }
 
 /// Greedy answers to grammar questions: exact-match accuracy per question kind.
@@ -821,7 +892,8 @@ pub fn grammar_accuracy(
     let mut by_kind: Vec<(String, usize, usize)> = Vec::new();
     for _ in 0..n {
         let q = &questions[rng.below(questions.len())];
-        let prompt = browser::obs::encode_dialog(&dialog::background_page(&mut rng), &[], &q.question, None);
+        let layout = engine.model.cfg.layout;
+        let prompt = browser::obs::encode_with(&layout, &dialog::background_page(&mut rng), &[], &q.question, &[]);
         let (out, _, _) = engine.respond(&prompt, rng.below(1 << 30) as u64)?;
         let ok =
             matches!(Action::decode(&out, text::ru()), Some(Action::Answer { text }) if text.trim() == q.answer.trim());
@@ -870,7 +942,7 @@ mod tests {
         let mut engine = UnifiedEngine::new(tr.model)?;
         let prompt = browser::obs::encode_dialog(&browser::data::snapshot("/w/1/", None), &[], "Привет!", None);
         let (out, thought, enc) = engine.respond(&prompt, 1)?;
-        assert_eq!(out.len(), ACTION_LEN);
+        assert_eq!(out.len(), engine.model.cfg.layout.action_len);
         assert!(thought.stats.tree_nodes > 0);
         assert_eq!(engine.alternatives(&enc, &thought)?.len(), thought.hypotheses.len());
         Ok(())

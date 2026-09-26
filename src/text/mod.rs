@@ -2,9 +2,9 @@
 //! shared special tokens, and a text corpus for next-chunk prediction (`--task text`).
 //!
 //! The shipped tokenizer (`models/tokenizer_ru.bpe`, [`ru`]) has 20 special tokens, 256 byte
-//! tokens and 7916 merges learned on the «ru20k» dataset (dialogues, example sentences for the
+//! tokens, 7916 merges and two appended specials (`THINK`, `LOOKUP`, ids 8192 and 8193) learned on the «ru20k» dataset (dialogues, example sentences for the
 //! 20 000 most frequent words, grammar questions — see `scripts/build_ru20k.py`), the UD Russian
-//! corpus and the browsing task's texts — 8192 tokens in total. Thanks to byte fallback any
+//! corpus and the browsing task's texts — 8194 tokens in total. Thanks to byte fallback any
 //! text, in any language, can be encoded. (The first agent used a 1024-token tokenizer trained
 //! on UD Russian alone; it and that agent's checkpoint are in the repository history.)
 //!
@@ -50,6 +50,14 @@ pub const CALC: u32 = 17;
 pub const USER: u32 = 18;
 /// …and what the agent answered. Also the first input of the speech decoder.
 pub const BOT: u32 = 19;
+/// Specials appended after the merges (ids 8192, 8193): a step of reasoning written into the
+/// agent's scratchpad, and a dictionary look-up (see docs/scaling.md). Models trained before
+/// them have 8192 tokens.
+pub const EXTRAS: [&str; 2] = ["THINK", "LOOKUP"];
+pub const THINK: u32 = 8192;
+pub const LOOKUP: u32 = 8193;
+/// Vocabulary size without [`EXTRAS`].
+pub const BASE_VOCAB: usize = 8192;
 
 static RU: OnceLock<Bpe> = OnceLock::new();
 
@@ -58,6 +66,7 @@ pub fn ru() -> &'static Bpe {
     RU.get_or_init(|| {
         let bpe = Bpe::from_text(include_str!("../../models/tokenizer_ru.bpe")).expect("valid shipped tokenizer");
         assert_eq!(bpe.num_specials(), SPECIALS.len(), "tokenizer specials out of sync with text::SPECIALS");
+        assert_eq!((bpe.special("THINK"), bpe.special("LOOKUP")), (Some(THINK), Some(LOOKUP)), "appended specials");
         bpe
     })
 }
@@ -202,7 +211,7 @@ mod tests {
     #[test]
     fn shipped_tokenizer_round_trips_russian() {
         let bpe = ru();
-        assert_eq!(bpe.vocab_size(), 8192);
+        assert_eq!(bpe.vocab_size(), BASE_VOCAB + EXTRAS.len());
         for (i, s) in SPECIALS.iter().enumerate() {
             assert_eq!(bpe.special(s), Some(i as u32));
         }

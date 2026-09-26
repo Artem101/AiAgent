@@ -20,10 +20,12 @@ use std::path::Path;
 
 use candle_core::{bail, Error, Result};
 
-use crate::browser::action::{Action, ACTION_LEN};
+use crate::browser::action::Action;
 use crate::browser::data as bdata;
+use crate::browser::expert;
+use crate::browser::goal::Goal;
 use crate::browser::goal::Split;
-use crate::browser::obs::{self, Turn, OBS_LEN};
+use crate::browser::obs::{self, Entry, Layout, Note, Turn};
 use crate::browser::world::{url_encode, CATALOG_PAGES, ITEMS};
 use crate::browser::PageSnapshot;
 use crate::kernels::rng::Rng;
@@ -36,10 +38,12 @@ pub enum Source {
     Dialog,
     Grammar,
     Text,
+    /// Reasoning chains of the school dataset (second observation format only).
+    School,
 }
 
 impl Source {
-    pub const ALL: [Source; 4] = [Self::Browser, Self::Dialog, Self::Grammar, Self::Text];
+    pub const ALL: [Source; 5] = [Self::Browser, Self::Dialog, Self::Grammar, Self::Text, Self::School];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -47,13 +51,96 @@ impl Source {
             Self::Dialog => "dialogue",
             Self::Grammar => "grammar",
             Self::Text => "text",
+            Self::School => "school",
         }
     }
 }
 
-/// Share of each source in training batches.
+/// Share of each source in training batches (first observation format).
 pub const MIX: [(Source, f64); 4] =
     [(Source::Browser, 0.35), (Source::Dialog, 0.35), (Source::Grammar, 0.15), (Source::Text, 0.15)];
+
+/// Share of each source with the scratchpad format (docs/scaling.md).
+pub const MIX_V2: [(Source, f64); 5] = [
+    (Source::School, 0.35),
+    (Source::Browser, 0.25),
+    (Source::Dialog, 0.25),
+    (Source::Grammar, 0.05),
+    (Source::Text, 0.10),
+];
+
+/// The mixture for an observation format.
+pub fn mix(layout: &Layout) -> &'static [(Source, f64)] {
+    if layout.scratchpad {
+        &MIX_V2
+    } else {
+        &MIX
+    }
+}
+
+/// A step of a school reasoning chain.
+#[derive(Debug, Clone)]
+pub struct ChainStep {
+    /// `THINK`, `CALC`, `LOOKUP` or `ANSWER`.
+    pub act: String,
+    pub text: String,
+    /// The tool's reply (`CALC`, `LOOKUP`).
+    pub result: Option<String>,
+}
+
+impl ChainStep {
+    /// The step as the agent's action.
+    pub fn action(&self) -> Option<Action> {
+        let text = self.text.clone();
+        Some(match self.act.as_str() {
+            "THINK" => Action::Think { text },
+            "CALC" => Action::Calc { text },
+            "LOOKUP" => Action::Lookup { text },
+            "ANSWER" => Action::Answer { text },
+            _ => return None,
+        })
+    }
+
+    /// What the step leaves in the scratchpad (nothing for the answer).
+    pub fn entry(&self) -> Option<Entry> {
+        let r = || self.result.clone().unwrap_or_default();
+        match self.act.as_str() {
+            "THINK" => Some(Entry::Think(self.text.clone())),
+            "CALC" => Some(Entry::Calc(Note { expr: self.text.clone(), result: r() })),
+            "LOOKUP" => Some(Entry::Lookup { word: self.text.clone(), entry: r() }),
+            _ => None,
+        }
+    }
+}
+
+/// A school task: the question and the chain of steps that solves it (`scripts/build_school.py`).
+#[derive(Debug, Clone)]
+pub struct Chain {
+    pub id: String,
+    pub grade: u8,
+    pub subject: String,
+    pub topic: String,
+    pub question: String,
+    pub steps: Vec<ChainStep>,
+    /// `number` or `text`, and the value the answer must state.
+    pub check_type: String,
+    pub check: String,
+}
+
+impl Chain {
+    /// Whether `answer` states the expected value: the number among the answer's numbers, or
+    /// the text in it (case and `ё` ignored).
+    pub fn accepts(&self, answer: &str) -> bool {
+        let norm = |t: &str| t.to_lowercase().replace('ё', "е");
+        if self.check_type == "number" {
+            let want = crate::tools::calc::run(&self.check);
+            crate::browser::goal::numbers(answer).iter().any(|n| want.is_ok() && crate::tools::calc::run(n) == want)
+        } else {
+            let a = norm(answer);
+            norm(&self.check).split('|').all(|part| a.contains(part.trim()))
+        }
+    }
+}
 
 /// A dialogue excerpt: the earlier turns (the last one is the user's line) and the reply.
 #[derive(Debug, Clone)]
@@ -80,6 +167,12 @@ pub struct LanguageData {
     pub questions_heldout: Vec<Question>,
     pub sentences: Vec<String>,
     pub sentences_valid: Vec<String>,
+    /// School reasoning chains by split (empty unless [`LanguageData::load_school`] was called).
+    pub school: Vec<Chain>,
+    pub school_valid: Vec<Chain>,
+    pub school_test: Vec<Chain>,
+    /// Curriculum: school tasks above this grade are not sampled (0 = no limit).
+    pub max_grade: u8,
 }
 
 fn read(path: &Path) -> Result<String> {
@@ -147,6 +240,45 @@ impl LanguageData {
         Ok(d)
     }
 
+    /// Loads the school chains (`chains.jsonl` of `scripts/build_school.py`).
+    pub fn load_school(&mut self, path: &Path) -> Result<()> {
+        for line in read(path)?.lines() {
+            let v: serde_json::Value = serde_json::from_str(line).map_err(candle_core::Error::wrap)?;
+            let st = |k: &str| v[k].as_str().unwrap_or_default().to_string();
+            let steps = v["steps"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .map(|x| ChainStep {
+                            act: x["act"].as_str().unwrap_or_default().to_string(),
+                            text: x["text"].as_str().unwrap_or_default().to_string(),
+                            result: x["result"].as_str().map(String::from),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let chain = Chain {
+                id: st("id"),
+                grade: v["grade"].as_u64().unwrap_or(0) as u8,
+                subject: st("subject"),
+                topic: st("topic"),
+                question: st("question"),
+                steps,
+                check_type: v["check"]["type"].as_str().unwrap_or("text").to_string(),
+                check: v["check"]["value"].as_str().unwrap_or_default().to_string(),
+            };
+            match v["split"].as_str() {
+                Some("valid") => self.school_valid.push(chain),
+                Some("test") => self.school_test.push(chain),
+                _ => self.school.push(chain),
+            }
+        }
+        if self.school.is_empty() {
+            bail!("{}: no school chains", path.display())
+        }
+        Ok(())
+    }
+
     /// A tiny built-in data set (tests, smoke runs without the downloads).
     pub fn builtin() -> Self {
         let dialog = |t: &[&str], r: &str| Dialog { turns: t.iter().map(|s| s.to_string()).collect(), reply: r.into() };
@@ -168,6 +300,25 @@ impl LanguageData {
             "Москва — столица России.".to_string(),
             "Кошка спит на тёплом диване.".to_string(),
         ];
+        let step = |act: &str, text: &str, result: Option<&str>| ChainStep {
+            act: act.into(),
+            text: text.into(),
+            result: result.map(String::from),
+        };
+        let school = vec![Chain {
+            id: "m1_story_00001".into(),
+            grade: 1,
+            subject: "математика".into(),
+            topic: "задачи «было — стало»".into(),
+            question: "У Маши было 9 яблок. Маша отдала 4 яблока другу. Сколько яблок осталось у Маши?".into(),
+            steps: vec![
+                step("THINK", "Было 9, 4 отдала — стало меньше, значит вычитаю.", None),
+                step("CALC", "9 - 4", Some("5")),
+                step("ANSWER", "Ответ: 5 яблок.", None),
+            ],
+            check_type: "number".into(),
+            check: "5".into(),
+        }];
         Self {
             dialogs_valid: dialogs[..2].to_vec(),
             dialogs,
@@ -175,6 +326,10 @@ impl LanguageData {
             questions,
             sentences_valid: sentences[..1].to_vec(),
             sentences,
+            school_valid: school.clone(),
+            school_test: school.clone(),
+            school,
+            max_grade: 0,
         }
     }
 }
@@ -183,15 +338,17 @@ impl LanguageData {
 #[derive(Debug, Clone)]
 pub struct Example {
     pub source: Source,
-    pub prompt: [u32; OBS_LEN],
-    pub answer: [u32; ACTION_LEN],
+    /// `layout.len` tokens.
+    pub prompt: Vec<u32>,
+    /// `layout.action_len` tokens.
+    pub answer: Vec<u32>,
 }
 
-/// A random source according to [`MIX`].
-pub fn source(rng: &mut Rng) -> Source {
+/// A random source according to the mixture of `layout`.
+pub fn source(rng: &mut Rng, layout: &Layout) -> Source {
     let u = rng.uniform();
     let mut acc = 0.0;
-    for (s, p) in MIX {
+    for &(s, p) in mix(layout) {
         acc += p;
         if u < acc {
             return s;
@@ -265,25 +422,30 @@ pub fn capitalize_quoted(text: &str) -> String {
     }
 }
 
-fn answer_tokens(text: &str) -> Option<[u32; ACTION_LEN]> {
-    Action::Answer { text: text.to_string() }.encode(text::ru())
+fn action_tokens(action: &Action, layout: &Layout) -> Option<Vec<u32>> {
+    action.encode_len(text::ru(), layout.action_len)
+}
+
+fn answer_tokens(text: &str, layout: &Layout) -> Option<Vec<u32>> {
+    action_tokens(&Action::Answer { text: text.to_string() }, layout)
 }
 
 /// A text-continuation example: `<text>` + the first tokens of a sentence (left-padded), and
-/// the next tokens up to [`ACTION_LEN`] − 1, then `<end>`.
-pub fn continuation(rng: &mut Rng, sentence: &str) -> Option<([u32; OBS_LEN], [u32; ACTION_LEN])> {
+/// the next tokens up to `action_len − 1`, then `<end>`.
+pub fn continuation(rng: &mut Rng, sentence: &str, layout: &Layout) -> Option<(Vec<u32>, Vec<u32>)> {
+    let (n_obs, n_act) = (layout.len, layout.action_len);
     let s = fragment(text::ru(), sentence);
     if s.len() < 2 {
         return None;
     }
     let cut = 1 + rng.below(s.len() - 1);
-    let ctx = &s[cut.saturating_sub(OBS_LEN - 1)..cut];
-    let mut prompt = [PAD; OBS_LEN];
-    prompt[OBS_LEN - 1 - ctx.len()] = TEXT;
-    prompt[OBS_LEN - ctx.len()..].copy_from_slice(ctx);
-    let mut answer = [PAD; ACTION_LEN];
+    let ctx = &s[cut.saturating_sub(n_obs - 1)..cut];
+    let mut prompt = vec![PAD; n_obs];
+    prompt[n_obs - 1 - ctx.len()] = TEXT;
+    prompt[n_obs - ctx.len()..].copy_from_slice(ctx);
+    let mut answer = vec![PAD; n_act];
     let rest = &s[cut..];
-    let n = rest.len().min(ACTION_LEN - 1);
+    let n = rest.len().min(n_act - 1);
     answer[..n].copy_from_slice(&rest[..n]);
     if n == rest.len() {
         answer[n] = END;
@@ -291,28 +453,133 @@ pub fn continuation(rng: &mut Rng, sentence: &str) -> Option<([u32; OBS_LEN], [u
     Some((prompt, answer))
 }
 
-/// One example of `source`; `split` picks training or held-out data (held-out browser tasks use
-/// the held-out wordings).
-pub fn example(rng: &mut Rng, data: &LanguageData, source: Source, split: Split) -> Example {
+/// A step of a thinking teacher's episode in the simulator (scratchpad format): the page, the
+/// scratchpad so far (thoughts, actions, calculator lines) and the teacher's next step.
+fn trajectory_step(rng: &mut Rng, split: Split) -> Option<(Goal, PageSnapshot, Vec<Entry>, Action)> {
+    use crate::browser::world::{home_url, World};
+    use crate::browser::{sim::SimBrowser, Browser, Role};
+    use crate::tools::{Calculator, RustCalc};
+    let world = rng.below(1 << 30) as u64;
+    let f = bdata::family(rng);
+    let goal = crate::browser::goal::sample(rng, &World::new(world), f, split);
+    let spec = goal.spec?;
+    let mut sim = SimBrowser::new();
+    sim.goto(&home_url(crate::browser::sim::SIM_ORIGIN, world)).ok()?;
+    let mut entries: Vec<Entry> = Vec::new();
+    let mut steps = Vec::new();
+    for _ in 0..24 {
+        let snap = sim.snapshot().ok()?;
+        let note = obs::last_calc(&entries).cloned();
+        let action = match spec {
+            crate::browser::Spec::Chat(c) => {
+                Action::Answer { text: c.replies()[rng.below(c.replies().len())].to_string() }
+            }
+            _ => expert::act(&spec, &snap, note.as_ref()),
+        };
+        let thought = matches!(entries.last(), Some(Entry::Think(_)));
+        let step = if thought { action.clone() } else { Action::Think { text: expert::explain(&spec, &action) } };
+        steps.push((snap.clone(), entries.clone(), step.clone()));
+        match &step {
+            Action::Think { text } => entries.push(Entry::Think(text.clone())),
+            Action::Calc { text } => entries.push(Entry::Calc(Note::of(text, &RustCalc.eval(text)))),
+            Action::Answer { .. } => break,
+            Action::Click { role, text } => {
+                sim.click(snap.find(*role, text)?).ok()?;
+                entries.push(Entry::Act(step.clone()));
+            }
+            Action::Type { text } => {
+                sim.type_text(snap.first(Role::Input)?, text).ok()?;
+                entries.push(Entry::Act(step.clone()));
+            }
+            Action::Back => {
+                sim.back().ok()?;
+                entries.push(Entry::Act(step.clone()));
+            }
+            Action::Lookup { .. } => return None,
+        }
+    }
+    let (snap, entries, step) = steps.swap_remove(rng.below(steps.len()));
+    Some((goal, snap, entries, step))
+}
+
+/// A browser state labelled by the teacher. With the scratchpad format the teacher thinks
+/// before every action: half of the states have its reason already in the scratchpad (the
+/// action follows), half do not (the reason — a `THINK` — is the target).
+fn browser_example(rng: &mut Rng, dialogs: &[Dialog], split: Split, layout: &Layout) -> Option<(Vec<u32>, Vec<u32>)> {
+    if layout.scratchpad && rng.uniform() < 0.5 {
+        // half of the states come from whole teacher episodes (realistic scratchpads)
+        let (goal, snap, entries, step) = trajectory_step(rng, split)?;
+        let history = if rng.uniform() < 0.25 { stray_history(rng, dialogs) } else { Vec::new() };
+        let prompt = obs::encode_with(layout, &snap, &history, &goal.text, &entries);
+        return action_tokens(&step, layout).map(|a| (prompt, a));
+    }
+    let (goal, snapshot, note, action) = bdata::raw(rng, split);
+    let spec = goal.spec.expect("sampled goals have a spec");
+    let mut entries = Vec::new();
+    let mut target = action.clone();
+    if let Some(n) = &note {
+        if layout.scratchpad {
+            entries.push(Entry::Think(expert::explain(&spec, &Action::Calc { text: n.expr.clone() })));
+        }
+        entries.push(Entry::Calc(n.clone()));
+    }
+    if layout.scratchpad {
+        let reason = expert::explain(&spec, &action);
+        if rng.uniform() < 0.5 {
+            target = Action::Think { text: reason };
+        } else {
+            entries.push(Entry::Think(reason));
+        }
+    }
+    let history = if rng.uniform() < 0.25 { stray_history(rng, dialogs) } else { Vec::new() };
+    let prompt = obs::encode_with(layout, &snapshot, &history, &goal.text, &entries);
+    action_tokens(&target, layout).map(|a| (prompt, a))
+}
+
+/// A step of a school reasoning chain: the question, the steps before it in the scratchpad, and
+/// the step itself as the target.
+fn school_example(rng: &mut Rng, data: &LanguageData, held: bool, layout: &Layout) -> Option<(Vec<u32>, Vec<u32>)> {
+    let pool = if held { &data.school_valid } else { &data.school };
+    if pool.is_empty() {
+        return None;
+    }
+    let mut c = &pool[rng.below(pool.len())];
+    for _ in 0..20 {
+        if data.max_grade == 0 || c.grade <= data.max_grade {
+            break;
+        }
+        c = &pool[rng.below(pool.len())];
+    }
+    let k = rng.below(c.steps.len());
+    let entries: Vec<Entry> = c.steps[..k].iter().filter_map(ChainStep::entry).collect();
+    let action = c.steps[k].action()?;
+    let dialogs = if held { &data.dialogs_valid } else { &data.dialogs };
+    let history = if rng.uniform() < 0.15 { stray_history(rng, dialogs) } else { Vec::new() };
+    let question = vary_case(rng, c.question.clone());
+    let prompt = obs::encode_with(layout, &background_page(rng), &history, &question, &entries);
+    action_tokens(&action, layout).map(|a| (prompt, a))
+}
+
+/// One example of `source` in `layout`; `split` picks training or held-out data (held-out
+/// browser tasks use the held-out wordings).
+pub fn example(rng: &mut Rng, data: &LanguageData, source: Source, split: Split, layout: &Layout) -> Example {
     let held = split == Split::HeldOut;
     let dialogs = if held { &data.dialogs_valid } else { &data.dialogs };
+    // without school chains (the first format, or no data) their share goes to dialogues
+    let source = if source == Source::School && (data.school.is_empty() || !layout.scratchpad) {
+        Source::Dialog
+    } else {
+        source
+    };
     loop {
         let made = match source {
-            Source::Browser => {
-                let l = bdata::labelled(rng, split);
-                let prompt = if rng.uniform() < 0.25 {
-                    let history = stray_history(rng, dialogs);
-                    obs::encode_dialog(&l.snapshot, &history, &l.goal.text, l.note.as_ref())
-                } else {
-                    l.observation
-                };
-                Some((prompt, l.action))
-            }
+            Source::Browser => browser_example(rng, dialogs, split, layout),
             Source::Dialog => {
                 let d = &dialogs[rng.below(dialogs.len())];
                 let (history, line) = dialog_turns(&d.turns);
                 let line = vary_case(rng, line);
-                answer_tokens(&d.reply).map(|a| (obs::encode_dialog(&background_page(rng), &history, &line, None), a))
+                answer_tokens(&d.reply, layout)
+                    .map(|a| (obs::encode_with(layout, &background_page(rng), &history, &line, &[]), a))
             }
             Source::Grammar => {
                 let qs = if held { &data.questions_heldout } else { &data.questions };
@@ -321,14 +588,15 @@ pub fn example(rng: &mut Rng, data: &LanguageData, source: Source, split: Split)
                 // the word asked about is sometimes capitalised («Книга»); its forms stay lower-case
                 let question = if rng.uniform() < 0.2 { capitalize_quoted(&q.question) } else { q.question.clone() };
                 let question = vary_case(rng, question);
-                answer_tokens(&q.answer)
-                    .map(|a| (obs::encode_dialog(&background_page(rng), &history, &question, None), a))
+                answer_tokens(&q.answer, layout)
+                    .map(|a| (obs::encode_with(layout, &background_page(rng), &history, &question, &[]), a))
             }
             Source::Text => {
                 let ss = if held { &data.sentences_valid } else { &data.sentences };
                 let i = rng.below(ss.len());
-                continuation(rng, &ss[i])
+                continuation(rng, &ss[i], layout)
             }
+            Source::School => school_example(rng, data, held, layout),
         };
         if let Some((prompt, answer)) = made {
             return Example { source, prompt, answer };
@@ -336,12 +604,12 @@ pub fn example(rng: &mut Rng, data: &LanguageData, source: Source, split: Split)
     }
 }
 
-/// `n` examples mixed according to [`MIX`].
-pub fn mixed(rng: &mut Rng, data: &LanguageData, n: usize, split: Split) -> Vec<Example> {
+/// `n` examples mixed according to the mixture of `layout`.
+pub fn mixed(rng: &mut Rng, data: &LanguageData, n: usize, split: Split, layout: &Layout) -> Vec<Example> {
     (0..n)
         .map(|_| {
-            let s = source(rng);
-            example(rng, data, s, split)
+            let s = source(rng, layout);
+            example(rng, data, s, split, layout)
         })
         .collect()
 }
@@ -355,20 +623,28 @@ mod tests {
     fn examples_have_the_agent_format() {
         let data = LanguageData::builtin();
         let mut rng = Rng::new(4);
-        for source in Source::ALL {
-            for _ in 0..40 {
-                let e = example(&mut rng, &data, source, Split::Train);
-                match source {
-                    Source::Text => {
-                        assert!(e.prompt.contains(&TEXT));
-                        assert!(!e.prompt.contains(&GOAL));
+        for layout in [Layout::V1, Layout::V2] {
+            for source in Source::ALL {
+                for _ in 0..40 {
+                    let e = example(&mut rng, &data, source, Split::Train, &layout);
+                    assert_eq!((e.prompt.len(), e.answer.len()), (layout.len, layout.action_len));
+                    match e.source {
+                        Source::Text => {
+                            assert!(e.prompt.contains(&TEXT));
+                            assert!(!e.prompt.contains(&GOAL));
+                        }
+                        Source::Dialog | Source::Grammar => {
+                            assert_eq!(e.answer[0], ANSWER);
+                            assert!(e.prompt.contains(&GOAL));
+                            assert!(Action::decode(&e.answer, text::ru()).is_some());
+                        }
+                        Source::Browser | Source::School => {
+                            assert!(Action::decode(&e.answer, text::ru()).is_some());
+                            assert!(layout.scratchpad || source != Source::School);
+                        }
                     }
-                    Source::Dialog | Source::Grammar => {
-                        assert_eq!(e.answer[0], ANSWER);
-                        assert!(e.prompt.contains(&GOAL));
-                        assert!(Action::decode(&e.answer, text::ru()).is_some());
-                    }
-                    Source::Browser => assert!(Action::decode(&e.answer, text::ru()).is_some()),
+                    // THINK and LOOKUP only exist in the scratchpad format
+                    assert!(layout.scratchpad || !e.answer.contains(&text::THINK));
                 }
             }
         }
@@ -379,6 +655,29 @@ mod tests {
         let t = obs::history_tokens(&h, text::ru());
         assert_eq!((t[0], t.iter().filter(|&&x| x == BOT).count()), (USER, 1));
         assert_eq!(capitalize_quoted("Какого рода слово «книга»?"), "Какого рода слово «Книга»?");
+    }
+
+    #[test]
+    fn school_steps_see_the_steps_before_them() {
+        let data = LanguageData::builtin();
+        let c = &data.school[0];
+        assert!(c.accepts("Ответ: 5 яблок.") && !c.accepts("Ответ: 6 яблок."));
+        let mut rng = Rng::new(2);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..60 {
+            let e = example(&mut rng, &data, Source::School, Split::Train, &Layout::V2);
+            let verb = e.answer[0];
+            seen.insert(verb);
+            // the calculator step sees the thought before it; the answer sees the result
+            if verb == text::CALC {
+                assert!(e.prompt.contains(&text::THINK));
+            }
+            if verb == ANSWER {
+                let tail = text::ru().decode(&e.prompt);
+                assert!(tail.contains("9 - 4 = 5"), "{tail}");
+            }
+        }
+        assert_eq!(seen.len(), 3, "THINK, CALC and ANSWER are all targets");
     }
 
     #[test]

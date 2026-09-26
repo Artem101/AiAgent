@@ -42,6 +42,7 @@ pub mod copy;
 pub mod data;
 pub mod dialog;
 pub mod flow;
+pub mod grow;
 pub mod jepa;
 pub mod kernels;
 pub mod model;

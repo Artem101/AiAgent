@@ -9,7 +9,7 @@ use candle_core::Result;
 
 use super::action::Action;
 use super::goal::{self, Family, Goal, Split};
-use super::obs::{self, Note, OBS_LEN};
+use super::obs::{self, Entry, Layout, Note};
 use super::world::{self, World};
 use super::{data, expert, Browser, PageSnapshot, Role};
 use crate::kernels::rng::Rng;
@@ -36,6 +36,10 @@ pub trait Policy {
     fn last_reasoning(&self) -> Option<Reasoning> {
         None
     }
+    /// The observation format the policy reads.
+    fn layout(&self) -> Layout {
+        Layout::V1
+    }
 }
 
 /// The scripted teacher ([`expert::act`]); needs the structured goal.
@@ -51,6 +55,37 @@ impl Policy for ExpertPolicy {
     ) -> Result<Vec<u32>> {
         let Some(spec) = &goal.spec else { candle_core::bail!("the teacher needs a recognised question") };
         Ok(expert::act(spec, snapshot, note).encode(text::ru()).map(|a| a.to_vec()).unwrap_or_default())
+    }
+}
+
+/// The teacher of the second observation format: before every action it thinks aloud — a
+/// `THINK` step with its reason ([`expert::explain`]) — then acts.
+pub struct ThinkingExpertPolicy;
+
+/// Whether the newest step in the scratchpad of a [`Layout::V2`] observation is a `THINK`
+/// (not a tool call or a browser action).
+pub fn just_thought(observation: &[u32]) -> bool {
+    use text::{BACK, CALC, CLICK, LOOKUP, THINK, TYPE};
+    observation.iter().rev().find(|&&t| [THINK, CALC, LOOKUP, CLICK, TYPE, BACK].contains(&t)) == Some(&THINK)
+}
+
+impl Policy for ThinkingExpertPolicy {
+    fn act(
+        &mut self,
+        observation: &[u32],
+        goal: &Goal,
+        snapshot: &PageSnapshot,
+        note: Option<&Note>,
+    ) -> Result<Vec<u32>> {
+        let Some(spec) = &goal.spec else { candle_core::bail!("the teacher needs a recognised question") };
+        let action = expert::act(spec, snapshot, note);
+        let action =
+            if just_thought(observation) { action } else { Action::Think { text: expert::explain(spec, &action) } };
+        Ok(action.encode_len(text::ru(), Layout::V2.action_len).unwrap_or_default())
+    }
+
+    fn layout(&self) -> Layout {
+        Layout::V2
     }
 }
 
@@ -126,7 +161,7 @@ impl Policy for EnginePolicy {
 #[derive(Debug, Clone)]
 pub struct Step {
     pub url: String,
-    pub observation: [u32; OBS_LEN],
+    pub observation: Vec<u32>,
     /// Raw policy output.
     pub output: Vec<u32>,
     /// `None` when the output is not a well-formed action.
@@ -135,6 +170,8 @@ pub struct Step {
     pub error: Option<String>,
     /// What the calculator returned for a `CALC` action, and which one answered.
     pub tool: Option<(Note, String)>,
+    /// What the step wrote into the scratchpad (`THINK`, `CALC`, `LOOKUP`).
+    pub added: Option<Entry>,
     /// Time the policy took to decide.
     pub think_time: Duration,
     /// Planner statistics and timings of this step (if the policy is the engine).
@@ -179,7 +216,7 @@ fn execute(browser: &mut dyn Browser, snap: &PageSnapshot, action: &Action) -> R
             None => Ok(Some("no text field on the page".into())),
         },
         Action::Back => browser.back().map(|_| None),
-        Action::Answer { .. } | Action::Calc { .. } => Ok(None),
+        Action::Answer { .. } | Action::Calc { .. } | Action::Think { .. } | Action::Lookup { .. } => Ok(None),
     }
 }
 
@@ -215,28 +252,55 @@ pub fn run_dialog_episode(
     mut on_step: impl FnMut(&Step),
 ) -> Result<Episode> {
     browser.goto(&world::home_url(origin, world))?;
+    let layout = policy.layout();
     let mut steps = Vec::new();
     let mut answer = None;
-    let mut note: Option<Note> = None;
-    for _ in 0..max_steps {
+    let mut entries: Vec<Entry> = Vec::new();
+    // `max_steps` counts actions; steps of reasoning come on top (at most as many)
+    let (mut acts, mut thoughts) = (0, 0);
+    while acts < max_steps && thoughts <= max_steps {
         let snap = browser.snapshot()?;
-        let observation = obs::encode_dialog(&snap, history, &goal.text, note.as_ref());
+        let observation = obs::encode_with(&layout, &snap, history, &goal.text, &entries);
+        let note = obs::last_calc(&entries).cloned();
         let t0 = Instant::now();
         let output = policy.act(&observation, goal, &snap, note.as_ref())?;
         let think_time = t0.elapsed();
         let action = Action::decode(&output, text::ru());
-        let mut tool = None;
+        let (mut tool, mut added) = (None, None);
+        if matches!(action, Some(Action::Think { .. })) {
+            thoughts += 1;
+        } else {
+            acts += 1;
+        }
         let error = match &action {
             Some(Action::Calc { text }) => {
                 let reply = calc.eval(text);
                 let n = Note::of(text, &reply);
-                note = Some(n.clone());
-                tool = Some((n, calc.name().to_string()));
+                tool = Some((n.clone(), calc.name().to_string()));
+                added = Some(Entry::Calc(n));
                 reply.err().map(|e| format!("calculator: {e}"))
             }
-            Some(a) => execute(browser, &snap, a)?,
+            Some(Action::Think { text }) => {
+                added = Some(Entry::Think(text.clone()));
+                None
+            }
+            Some(Action::Lookup { text }) => {
+                let entry = crate::tools::dictionary::shared().lookup(text);
+                added = Some(Entry::Lookup { word: text.clone(), entry });
+                None
+            }
+            Some(a) => {
+                let err = execute(browser, &snap, a)?;
+                if !matches!(a, Action::Answer { .. }) {
+                    added = Some(Entry::Act(a.clone()));
+                }
+                err
+            }
             None => Some(format!("malformed action [{}]", obs::describe(&output))),
         };
+        if let Some(e) = &added {
+            entries.push(e.clone());
+        }
         let step = Step {
             url: snap.url,
             observation,
@@ -244,6 +308,7 @@ pub fn run_dialog_episode(
             action,
             error,
             tool,
+            added,
             think_time,
             plan: policy.last_generation(),
             thoughts: policy.last_reasoning(),

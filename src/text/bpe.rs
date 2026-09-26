@@ -18,6 +18,9 @@ const MAGIC: &str = "cog_engine-bpe 1";
 #[derive(Debug, Clone)]
 pub struct Bpe {
     specials: Vec<String>,
+    /// Special tokens appended after the merges (ids `vocab − extras.len() ..`): added to a
+    /// trained tokenizer without renumbering it, so a model's embeddings stay valid.
+    extras: Vec<String>,
     /// Merge `i` joins `merges[i]` into token `first_merge() + i`.
     merges: Vec<(u32, u32)>,
     ranks: HashMap<(u32, u32), u32>,
@@ -86,6 +89,7 @@ impl Bpe {
         pieces.extend((0..=255u8).map(|b| vec![b]));
         Self {
             specials: specials.iter().map(|s| s.to_string()).collect(),
+            extras: vec![],
             merges: vec![],
             ranks: HashMap::new(),
             pieces,
@@ -192,11 +196,42 @@ impl Bpe {
 
     /// Id of a special token by name.
     pub fn special(&self, name: &str) -> Option<u32> {
-        self.specials.iter().position(|s| s == name).map(|i| i as u32)
+        self.specials
+            .iter()
+            .position(|s| s == name)
+            .map(|i| i as u32)
+            .or_else(|| self.extras.iter().position(|s| s == name).map(|i| (self.first_extra() + i) as u32))
     }
 
     pub fn is_special(&self, id: u32) -> bool {
-        (id as usize) < self.specials.len()
+        let id = id as usize;
+        id < self.specials.len() || (id >= self.first_extra() && id < self.pieces.len())
+    }
+
+    /// Id of the first appended special token (= the vocabulary size without them).
+    pub fn first_extra(&self) -> usize {
+        self.pieces.len() - self.extras.len()
+    }
+
+    /// Name of a special token.
+    pub fn special_name(&self, id: u32) -> Option<&str> {
+        let id = id as usize;
+        if id < self.specials.len() {
+            Some(&self.specials[id])
+        } else if id >= self.first_extra() && id < self.pieces.len() {
+            Some(&self.extras[id - self.first_extra()])
+        } else {
+            None
+        }
+    }
+
+    /// Appends special tokens after the merges (see `extras`).
+    pub fn with_extras(mut self, names: &[&str]) -> Self {
+        for n in names {
+            self.extras.push(n.to_string());
+            self.pieces.push(Vec::new());
+        }
+        self
     }
 
     /// Bytes of a token (empty for specials and out-of-range ids).
@@ -249,7 +284,7 @@ impl Bpe {
                 if !out.is_empty() {
                     out.push(' ');
                 }
-                out.push_str(&self.specials[i as usize]);
+                out.push_str(self.special_name(i).unwrap_or("<?>"));
                 prev_text = false;
             } else {
                 if prev_text && std::str::from_utf8(&text).is_ok() {
@@ -277,6 +312,13 @@ impl Bpe {
         for (a, b) in &self.merges {
             s.push_str(&format!("{a} {b}\n"));
         }
+        if !self.extras.is_empty() {
+            s.push_str(&format!("extras {}\n", self.extras.len()));
+            for e in &self.extras {
+                s.push_str(e);
+                s.push('\n');
+            }
+        }
         s
     }
 
@@ -301,7 +343,14 @@ impl Bpe {
             let &[a, b] = pair.as_slice() else { bail!("tokenizer file: bad merge line '{line}'") };
             bpe.add_merge((a, b))?;
         }
-        Ok(bpe)
+        match lines.next() {
+            None | Some("") => Ok(bpe),
+            line => {
+                let ne = count(line, "extras ")?;
+                let extras: Vec<&str> = lines.take(ne).collect();
+                Ok(bpe.with_extras(&extras))
+            }
+        }
     }
 
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
@@ -353,5 +402,15 @@ mod tests {
         let mut ids = vec![1];
         ids.extend(bpe.encode("лампа"));
         assert!(bpe.describe(&ids).starts_with("<a> "), "{}", bpe.describe(&ids));
+        // specials appended after the merges keep every other id
+        let ext = bpe.clone().with_extras(&["<x>", "<y>"]);
+        assert_eq!(ext.vocab_size(), bpe.vocab_size() + 2);
+        assert_eq!(ext.encode("лампа и стул"), bpe.encode("лампа и стул"));
+        let y = ext.special("<y>").unwrap();
+        assert_eq!(y as usize, bpe.vocab_size() + 1);
+        assert!(ext.is_special(y) && !ext.is_special(y - 2) && ext.is_special(1));
+        let back = Bpe::from_text(&ext.to_text()).unwrap();
+        assert_eq!((back.vocab_size(), back.special("<x>")), (ext.vocab_size(), ext.special("<x>")));
+        assert!(ext.describe(&[y]).contains("<y>"));
     }
 }

@@ -7,9 +7,13 @@
 //! | go back in history | `BACK <none> <end>` |
 //! | call the calculator | `CALC <none> ␣1·2·+·3·0 <end>` |
 //! | finish with an answer | `ANSWER <none> ␣4·2 <end>` |
+//! | think aloud (a step written into the scratchpad) | `THINK <none> ␣Цена·␣=·… <end>` |
+//! | look a word up in the dictionary | `LOOKUP <none> ␣подснежник <end>` |
+//!
+//! `THINK` and `LOOKUP` belong to the second observation format ([`super::obs::Layout::V2`]).
 
 use super::Role;
-use crate::text::{fragment, Bpe, ANSWER, BACK, CALC, CLICK, END, NONE, PAD, TYPE};
+use crate::text::{fragment, Bpe, ANSWER, BACK, CALC, CLICK, END, LOOKUP, NONE, PAD, THINK, TYPE};
 
 /// Tokens per action (`L`); must be divisible by the planning horizon.
 pub const ACTION_LEN: usize = 32;
@@ -33,23 +37,38 @@ pub enum Action {
     Answer {
         text: String,
     },
+    /// A step of reasoning, written into the agent's scratchpad.
+    Think {
+        text: String,
+    },
+    /// Look a word up in the dictionary (see [`crate::tools::dictionary`]).
+    Lookup {
+        text: String,
+    },
 }
 
 impl Action {
-    /// Token form; `None` if the text does not fit into [`MAX_TEXT`] tokens.
+    /// Token form of [`ACTION_LEN`] tokens; `None` if the text does not fit into [`MAX_TEXT`].
     pub fn encode(&self, bpe: &Bpe) -> Option<[u32; ACTION_LEN]> {
+        self.encode_len(bpe, ACTION_LEN).map(|v| v.try_into().expect("ACTION_LEN tokens"))
+    }
+
+    /// Token form of `len` tokens; `None` if the text does not fit into `len − 3` tokens.
+    pub fn encode_len(&self, bpe: &Bpe, len: usize) -> Option<Vec<u32>> {
         let (verb, role, text) = match self {
             Self::Click { role, text } => (CLICK, role.token(), text.as_str()),
             Self::Type { text } => (TYPE, Role::Input.token(), text.as_str()),
             Self::Back => (BACK, NONE, ""),
             Self::Calc { text } => (CALC, NONE, text.as_str()),
             Self::Answer { text } => (ANSWER, NONE, text.as_str()),
+            Self::Think { text } => (THINK, NONE, text.as_str()),
+            Self::Lookup { text } => (LOOKUP, NONE, text.as_str()),
         };
         let ids = fragment(bpe, text);
-        if ids.len() > MAX_TEXT {
+        if ids.len() + 3 > len {
             return None;
         }
-        let mut out = [PAD; ACTION_LEN];
+        let mut out = vec![PAD; len];
         out[0] = verb;
         out[1] = role;
         out[2..2 + ids.len()].copy_from_slice(&ids);
@@ -77,6 +96,8 @@ impl Action {
             BACK => Some(Self::Back),
             CALC if has_text && role == NONE => Some(Self::Calc { text }),
             ANSWER if has_text => Some(Self::Answer { text }),
+            THINK if has_text && role == NONE => Some(Self::Think { text }),
+            LOOKUP if has_text && role == NONE => Some(Self::Lookup { text }),
             _ => None,
         }
     }
@@ -90,6 +111,8 @@ impl std::fmt::Display for Action {
             Self::Back => write!(f, "BACK"),
             Self::Calc { text } => write!(f, "CALC «{text}»"),
             Self::Answer { text } => write!(f, "ANSWER «{text}»"),
+            Self::Think { text } => write!(f, "THINK «{text}»"),
+            Self::Lookup { text } => write!(f, "LOOKUP «{text}»"),
         }
     }
 }
@@ -134,6 +157,15 @@ mod tests {
             assert_eq!(Action::decode(&a.encode(bpe).expect(r), bpe), Some(a));
         }
         assert_eq!(Action::decode(&Action::Back.encode(bpe).unwrap(), bpe), Some(Action::Back));
+        for a in [
+            Action::Think {
+                text: "Было 11, 8 отдал — стало меньше, значит вычитаю.".into()
+            },
+            Action::Lookup { text: "подснежник".into() },
+        ] {
+            assert_eq!(Action::decode(&a.encode_len(bpe, 64).unwrap(), bpe), Some(a));
+        }
+        assert_eq!(Action::decode(&[THINK, Role::Link.token(), 300, END], bpe), None);
         assert_eq!(Action::decode(&[CALC, Role::Link.token(), 300, END], bpe), None);
         assert_eq!(Action::decode(&[CLICK, Role::Input.token(), 300, END], bpe), None);
         assert_eq!(Action::decode(&[ANSWER, NONE, END, PAD], bpe), None);

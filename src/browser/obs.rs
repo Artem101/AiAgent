@@ -14,8 +14,9 @@
 //! so a number reads the same on the page, in the question, in the tool result and in the
 //! answer.
 
+use super::action::ACTION_LEN;
 use super::{PageSnapshot, Role};
-use crate::text::{self, fragment, Bpe, BOT, CALC, EMPTY, GOAL, PAD, USER};
+use crate::text::{self, fragment, Bpe, BOT, CALC, EMPTY, GOAL, LOOKUP, PAD, THINK, USER};
 
 /// Prompt length `N` of the browsing task.
 pub const OBS_LEN: usize = 160;
@@ -25,6 +26,139 @@ pub const GOAL_MAX: usize = 40;
 pub const NOTE_MAX: usize = 24;
 /// Longest conversation history kept, in tokens (including the `<user>` / `<bot>` markers).
 pub const HISTORY_MAX: usize = 56;
+
+/// Sizes of an observation format. [`Layout::V1`] is the format of the shipped model (the
+/// constants above: the last calculator result is the only tool output kept); [`Layout::V2`]
+/// is the format of the scaled-up models of docs/scaling.md: longer observation and action,
+/// and a scratchpad with the agent's recent steps (`THINK`, `CALC`, `LOOKUP`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Layout {
+    /// Observation length `N`.
+    pub len: usize,
+    pub goal_max: usize,
+    pub history_max: usize,
+    /// Tokens of tool results (V1) or of the scratchpad (V2).
+    pub scratch_max: usize,
+    /// Action length `L`.
+    pub action_len: usize,
+    /// Keep every recent step (V2), or the last calculator result only (V1).
+    pub scratchpad: bool,
+}
+
+impl Layout {
+    pub const V1: Self = Self {
+        len: OBS_LEN,
+        goal_max: GOAL_MAX,
+        history_max: HISTORY_MAX,
+        scratch_max: NOTE_MAX,
+        action_len: ACTION_LEN,
+        scratchpad: false,
+    };
+    pub const V2: Self =
+        Self { len: 320, goal_max: 64, history_max: 56, scratch_max: 128, action_len: 64, scratchpad: true };
+
+    pub fn name(&self) -> &'static str {
+        if self.scratchpad {
+            "v2"
+        } else {
+            "v1"
+        }
+    }
+
+    pub fn parse(s: &str) -> candle_core::Result<Self> {
+        match s {
+            "v1" => Ok(Self::V1),
+            "v2" => Ok(Self::V2),
+            other => candle_core::bail!("unknown observation layout '{other}' (v1 | v2)"),
+        }
+    }
+}
+
+/// A step the agent took in this episode, kept in its scratchpad.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Entry {
+    /// A step of reasoning (`THINK`).
+    Think(String),
+    /// A calculator call and its result (`CALC`).
+    Calc(Note),
+    /// A dictionary look-up and the entry found (`LOOKUP`).
+    Lookup { word: String, entry: String },
+    /// A browser action taken (`CLICK [button] Найти`, `TYPE [input] лампа`, `BACK`): the agent
+    /// remembers what it already did.
+    Act(super::Action),
+}
+
+impl Entry {
+    /// `THINK …`, `CALC expr = result`, `LOOKUP word → entry`, `CLICK [role] text`.
+    pub fn tokens(&self, bpe: &Bpe) -> Vec<u32> {
+        let (marker, text) = match self {
+            Self::Think(t) => (vec![THINK], t.clone()),
+            Self::Calc(n) => (vec![CALC], format!("{} = {}", n.expr, n.result)),
+            Self::Lookup { word, entry } => (vec![LOOKUP], format!("{word} → {entry}")),
+            Self::Act(a) => {
+                let t = a.encode_len(bpe, 3 + 64).unwrap_or_default();
+                let end = t.iter().position(|&x| x == crate::text::END).unwrap_or(t.len());
+                return t[..end].to_vec();
+            }
+        };
+        let mut t = marker;
+        t.extend(fragment(bpe, &text));
+        t
+    }
+}
+
+/// The result of the last calculator call among `entries`.
+pub fn last_calc(entries: &[Entry]) -> Option<&Note> {
+    entries.iter().rev().find_map(|e| if let Entry::Calc(n) = e { Some(n) } else { None })
+}
+
+/// Tool results in the observation: in [`Layout::V1`] the last calculator result (at most
+/// `scratch_max` tokens); in [`Layout::V2`] the newest steps that fit into `scratch_max`,
+/// oldest first (the newest one is cut when it alone is too long).
+pub fn scratch_tokens(entries: &[Entry], layout: &Layout, bpe: &Bpe) -> Vec<u32> {
+    if !layout.scratchpad {
+        let mut t = last_calc(entries).map(|n| Entry::Calc(n.clone()).tokens(bpe)).unwrap_or_default();
+        t.truncate(layout.scratch_max);
+        return t;
+    }
+    let mut parts: Vec<Vec<u32>> = Vec::new();
+    let mut used = 0;
+    for e in entries.iter().rev() {
+        let mut t = e.tokens(bpe);
+        if used + t.len() > layout.scratch_max {
+            if parts.is_empty() {
+                t.truncate(layout.scratch_max);
+                parts.push(t);
+            }
+            break;
+        }
+        used += t.len();
+        parts.push(t);
+    }
+    parts.into_iter().rev().flatten().collect()
+}
+
+/// Encodes what the agent sees in `layout`: the page, the earlier turns, the instruction and
+/// the scratchpad (see the module docs).
+pub fn encode_with(
+    layout: &Layout,
+    snapshot: &PageSnapshot,
+    history: &[Turn],
+    instruction: &str,
+    entries: &[Entry],
+) -> Vec<u32> {
+    let bpe = text::ru();
+    let page = page_tokens(snapshot, bpe);
+    let mut tail = history_tokens_max(history, bpe, layout.history_max);
+    tail.extend(goal_tokens_max(instruction, bpe, layout.goal_max));
+    tail.extend(scratch_tokens(entries, layout, bpe));
+    tail.truncate(layout.len);
+    let mut out = vec![PAD; layout.len];
+    let n = page.len().min(layout.len - tail.len());
+    out[..n].copy_from_slice(&page[..n]);
+    out[layout.len - tail.len()..].copy_from_slice(&tail);
+    out
+}
 
 /// Who said a turn of the conversation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,9 +225,14 @@ pub fn page_tokens(snapshot: &PageSnapshot, bpe: &Bpe) -> Vec<u32> {
 
 /// `<goal>` + instruction tokens (at most [`GOAL_MAX`]).
 pub fn goal_tokens(instruction: &str, bpe: &Bpe) -> Vec<u32> {
+    goal_tokens_max(instruction, bpe, GOAL_MAX)
+}
+
+/// `<goal>` + instruction tokens (at most `max`).
+pub fn goal_tokens_max(instruction: &str, bpe: &Bpe, max: usize) -> Vec<u32> {
     let mut g = vec![GOAL];
     g.extend(fragment(bpe, instruction));
-    g.truncate(GOAL_MAX);
+    g.truncate(max);
     g
 }
 
@@ -110,14 +249,19 @@ pub fn note_tokens(note: Option<&Note>, bpe: &Bpe) -> Vec<u32> {
 /// newest turns are kept, and an older turn that does not fit whole is dropped (the newest one
 /// is cut instead).
 pub fn history_tokens(history: &[Turn], bpe: &Bpe) -> Vec<u32> {
+    history_tokens_max(history, bpe, HISTORY_MAX)
+}
+
+/// [`history_tokens`] with at most `max` tokens.
+pub fn history_tokens_max(history: &[Turn], bpe: &Bpe, max: usize) -> Vec<u32> {
     let mut parts: Vec<Vec<u32>> = Vec::new();
     let mut used = 0;
     for turn in history.iter().rev() {
         let mut t = vec![if turn.speaker == Speaker::User { USER } else { BOT }];
         t.extend(fragment(bpe, &turn.text));
-        if used + t.len() > HISTORY_MAX {
+        if used + t.len() > max {
             if parts.is_empty() {
-                t.truncate(HISTORY_MAX);
+                t.truncate(max);
                 parts.push(t);
             }
             break;
@@ -140,16 +284,8 @@ pub fn encode_dialog(
     instruction: &str,
     note: Option<&Note>,
 ) -> [u32; OBS_LEN] {
-    let bpe = text::ru();
-    let page = page_tokens(snapshot, bpe);
-    let mut tail = history_tokens(history, bpe);
-    tail.extend(goal_tokens(instruction, bpe));
-    tail.extend(note_tokens(note, bpe));
-    let mut out = [PAD; OBS_LEN];
-    let n = page.len().min(OBS_LEN - tail.len());
-    out[..n].copy_from_slice(&page[..n]);
-    out[OBS_LEN - tail.len()..].copy_from_slice(&tail);
-    out
+    let entries: Vec<Entry> = note.map(|n| Entry::Calc(n.clone())).into_iter().collect();
+    encode_with(&Layout::V1, snapshot, history, instruction, &entries).try_into().expect("OBS_LEN tokens")
 }
 
 /// Readable form of an observation or action (BPE pieces separated by `·`).

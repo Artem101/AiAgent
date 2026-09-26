@@ -128,6 +128,8 @@ pub struct SpeechDecoder {
     blocks: Vec<Block>,
     pub out_bias: Tensor,
     pub copy: Option<CopyHead>,
+    /// Multiplies the vocabulary logits (½ after a width doubling, see `UnifiedModel::grow`).
+    pub logit_scale: f64,
     heads: usize,
     max_len: usize,
 }
@@ -173,10 +175,12 @@ impl SpeechDecoder {
             copy: if cfg.copy_dim > 0 {
                 let mut c = CopyHead::named(ps, "speech.copy", d, cfg.copy_dim, min_token)?;
                 c.mask_specials = true;
+                c.max_token = crate::text::BASE_VOCAB as u32;
                 Some(c)
             } else {
                 None
             },
+            logit_scale: 1.0,
             heads: cfg.n_heads,
             max_len: cfg.max_len,
         })
@@ -239,12 +243,15 @@ impl SpeechDecoder {
     pub fn logits(&self, hidden: &Tensor) -> Result<Tensor> {
         let (b, l, d) = hidden.dims3()?;
         let w = self.tok_emb.to_dtype(hidden.dtype())?;
-        hidden
-            .reshape((b * l, d))?
-            .matmul(&w.t()?)?
-            .broadcast_add(&self.out_bias.to_dtype(hidden.dtype())?)?
-            .to_dtype(DType::F32)?
-            .reshape((b, l, self.vocab()))
+        let mut logits = hidden.reshape((b * l, d))?.matmul(&w.t()?)?;
+        if self.logit_scale != 1.0 {
+            logits = (logits * self.logit_scale)?;
+        }
+        logits.broadcast_add(&self.out_bias.to_dtype(hidden.dtype())?)?.to_dtype(DType::F32)?.reshape((
+            b,
+            l,
+            self.vocab(),
+        ))
     }
 
     /// Decoder inputs for teacher forcing: `[<bot>, y_0, …, y_{L−2}]`.
@@ -313,7 +320,7 @@ impl SpeechDecoder {
             let lambda = 1.0 / (1.0 + (-gate[r]).exp());
             out[r].iter_mut().for_each(|x| *x *= 1.0 - lambda);
             for (&tok, &w) in context[r].iter().zip(&p[r]) {
-                if tok >= copy.min_token {
+                if copy.copyable(tok) {
                     out[r][tok as usize] += lambda * w;
                 }
             }
@@ -384,7 +391,7 @@ impl SpeechDecoder {
                     let lambda = 1.0 / (1.0 + (-gv[r]).exp());
                     dist.iter_mut().for_each(|x| *x *= 1.0 - lambda);
                     for (&tok, &w) in context[r].iter().zip(&pv[r]) {
-                        if tok >= copy.min_token {
+                        if copy.copyable(tok) {
                             dist[tok as usize] += lambda * w;
                         }
                     }

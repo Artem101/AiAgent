@@ -30,7 +30,11 @@ fn language_data(a: &Args) -> Result<LanguageData> {
     }
     let ud = a.get("ud", "data/ru");
     let t0 = Instant::now();
-    let d = LanguageData::load(Path::new(&dir), (ud != "none").then_some(Path::new(&ud)))?;
+    let mut d = LanguageData::load(Path::new(&dir), (ud != "none").then_some(Path::new(&ud)))?;
+    if let Some(school) = a.opts.get("school") {
+        d.load_school(Path::new(school))?;
+        println!("school: {} chains (+{} valid, {} test)", d.school.len(), d.school_valid.len(), d.school_test.len());
+    }
     println!(
         "data: {} dialogues (+{} valid), {} grammar questions (+{} on held-out lemmas), {} sentences (+{} valid) in {:.1?}",
         d.dialogs.len(),
@@ -75,7 +79,24 @@ pub fn cmd_train(a: &Args) -> Result<()> {
     cfg.speech.n_heads = a.num("heads", cfg.speech.n_heads)?;
     cfg.speech.copy_dim = a.num("copy", cfg.speech.copy_dim)?;
     cfg.teacher_plan = a.num("teacher-plan", cfg.teacher_plan)?;
-    let model = UnifiedModel::new(cfg, &Device::Cpu)?;
+    let model = match a.opts.get("grow-from") {
+        // a trained model twice as wide, in the scratchpad format (docs/scaling.md, section 5)
+        Some(src) => {
+            let base = UnifiedModel::load(src, &Device::Cpu)?;
+            let layout = cog_engine::browser::obs::Layout::parse(&a.get("layout", "v2"))?;
+            let vocab = if layout.scratchpad { text::ru().vocab_size() } else { base.cfg.engine.vocab_size };
+            let grown = cog_engine::grow::grow(&base, layout, vocab, a.num("grow-noise", 1e-3)?, cfg.engine.seed)?;
+            println!(
+                "grown from {src}: {} → {} parameters, layout {}, {} tokens",
+                base.num_params(),
+                grown.num_params(),
+                layout.name(),
+                vocab
+            );
+            grown
+        }
+        None => UnifiedModel::new(cfg, &Device::Cpu)?,
+    };
     if let Some(init) = a.opts.get("init") {
         model.load_weights(init)?;
         println!("initialised from {init}");
@@ -227,6 +248,7 @@ pub fn cmd_eval(a: &Args) -> Result<()> {
     println!("held-out loss per token (accuracy of the most likely token):\n  {}", validation(&model, &data, n, 99)?);
     let mut engine = UnifiedEngine::new(model)?;
     engine.search = a.num::<u8>("search", 1)? != 0;
+    let layout = engine.model.cfg.layout;
     let q = a.num("grammar", 300)?;
     if q > 0 {
         for (name, qs) in [("held-out lemmas", &data.questions_heldout), ("training lemmas", &data.questions)] {
@@ -258,7 +280,7 @@ pub fn cmd_eval(a: &Args) -> Result<()> {
     };
     println!("replies (on the start page, no history):");
     for line in lines {
-        let prompt = obs::encode_dialog(&cog_engine::browser::data::snapshot("/w/1/", None), &[], line, None);
+        let prompt = obs::encode_with(&layout, &cog_engine::browser::data::snapshot("/w/1/", None), &[], line, &[]);
         let (out, _, _) = engine.respond(&prompt, 1)?;
         println!("  {line:<44} → {}", say(&out));
     }
@@ -269,10 +291,19 @@ pub fn cmd_eval(a: &Args) -> Result<()> {
         for _ in 0..dialogs {
             let d = &data.dialogs_valid[rng.below(data.dialogs_valid.len())];
             let (history, line) = dialog::dialog_turns(&d.turns);
-            let prompt = obs::encode_dialog(&cog_engine::browser::data::snapshot("/w/1/", None), &history, &line, None);
+            let prompt =
+                obs::encode_with(&layout, &cog_engine::browser::data::snapshot("/w/1/", None), &history, &line, &[]);
             let (out, _, _) = engine.respond(&prompt, 1)?;
             println!("  {} → {} | {}", d.turns.join(" / "), d.reply, say(&out));
         }
+    }
+    let school_n = a.num("school-n", 300)?;
+    if layout.scratchpad && !data.school_test.is_empty() && school_n > 0 {
+        engine.sampling = Sampling::GREEDY;
+        let mut policy = UnifiedPolicy::new(engine);
+        let r = school_eval(&mut policy, &data.school_test, school_n, a)?;
+        println!("{r}");
+        engine = policy.engine;
     }
     let episodes = a.num("episodes", 200)?;
     if episodes > 0 {
@@ -309,57 +340,6 @@ fn render_page(snap: &cog_engine::browser::PageSnapshot) -> String {
         .join(" | ")
 }
 
-/// The teacher's reason for `action` (a THINK step of the exported trajectories).
-fn explain(spec: &cog_engine::browser::Spec, action: &Action) -> String {
-    use cog_engine::browser::goal::{Spec, TotalKind};
-    use cog_engine::browser::world::{Attr, ITEMS, UI_CATALOG, UI_FIND, UI_HOME, UI_NEXT};
-    let attr_name = |a: Attr| match a {
-        Attr::Price => "цену",
-        Attr::Color => "цвет",
-        Attr::Brand => "бренд",
-        Attr::Rating => "рейтинг",
-    };
-    match (action, spec) {
-        (Action::Type { text }, _) => format!("Ищу «{text}» через поиск магазина."),
-        (Action::Click { text, .. }, _) if text == UI_FIND => "Запрос введён — нажимаю «Найти».".into(),
-        (Action::Click { text, .. }, _) if text == UI_NEXT => {
-            "На этой странице каталога подходящего товара нет — листаю дальше.".into()
-        }
-        (Action::Click { text, .. }, _) if text == UI_CATALOG => "Искать по условию удобнее в каталоге.".into(),
-        (Action::Click { text, .. }, _) if text == UI_HOME => {
-            "Эта страница не для этой задачи — иду на главную.".into()
-        }
-        (Action::Click { text, .. }, Spec::Lookup { attr, .. }) => {
-            format!(
-                "В результатах нет нужного столбца — открываю страницу товара «{text}», там есть {}.",
-                attr_name(*attr)
-            )
-        }
-        (Action::Click { text, .. }, _) => format!("Открываю «{text}»."),
-        (Action::Back, _) => "Это не та страница — возвращаюсь назад.".into(),
-        (Action::Calc { text }, Spec::Total { kind, .. }) => format!(
-            "Обе цены видны на странице: {} — {}.",
-            text,
-            match kind {
-                TotalKind::Sum => "складываю",
-                _ => "из большей цены вычитаю меньшую",
-            }
-        ),
-        (Action::Calc { text }, _) => format!("Считаю на калькуляторе: {text}."),
-        (Action::Answer { .. }, Spec::Lookup { item, attr }) => {
-            format!("{} товара «{}» видна на странице — отвечаю.", attr_name(*attr), ITEMS[*item].nom)
-        }
-        (Action::Answer { .. }, Spec::Compare { a, b, .. }) => {
-            format!("Оба товара, «{}» и «{}», в результатах: сравниваю их значения.", ITEMS[*a].nom, ITEMS[*b].nom)
-        }
-        (Action::Answer { .. }, Spec::Filter(_)) => "В этой строке каталога товар подходит под условие.".into(),
-        (Action::Answer { .. }, Spec::Calc { .. } | Spec::Total { .. }) => {
-            "Калькулятор вернул результат — отвечаю.".into()
-        }
-        (Action::Answer { .. }, Spec::Chat(_)) => "Это реплика собеседника, искать ничего не нужно — отвечаю.".into(),
-    }
-}
-
 /// Browser trajectories of the teacher in the format of the school dataset
 /// (`scripts/build_school.py`): one JSON object per episode, a THINK step with the teacher's
 /// reason before every action, and every action with the page it was taken on.
@@ -388,7 +368,9 @@ pub fn cmd_export(a: &Args) -> Result<()> {
             for _ in 0..12 {
                 let snap = sim.snapshot()?;
                 let action = expert::act(&spec, &snap, note.as_ref());
-                steps.push(serde_json::json!({"act": "THINK", "text": explain(&spec, &action)}));
+                steps.push(
+                    serde_json::json!({"act": "THINK", "text": cog_engine::browser::expert::explain(&spec, &action)}),
+                );
                 let mut step = serde_json::json!({
                     "url": snap.url.strip_prefix(origin).unwrap_or(&snap.url),
                     "page": render_page(&snap),
@@ -399,6 +381,8 @@ pub fn cmd_export(a: &Args) -> Result<()> {
                     Action::Back => ("BACK".to_string(), String::new()),
                     Action::Calc { text } => ("CALC".to_string(), text.clone()),
                     Action::Answer { text } => ("ANSWER".to_string(), text.clone()),
+                    Action::Think { text } => ("THINK".to_string(), text.clone()),
+                    Action::Lookup { text } => ("LOOKUP".to_string(), text.clone()),
                 };
                 step["act"] = act.into();
                 step["text"] = text.into();
@@ -414,7 +398,7 @@ pub fn cmd_export(a: &Args) -> Result<()> {
                         step["result"] = n.result.clone().into();
                         note = Some(n);
                     }
-                    Action::Answer { .. } => {}
+                    Action::Answer { .. } | Action::Think { .. } | Action::Lookup { .. } => {}
                 }
                 steps.push(step);
                 if matches!(action, Action::Answer { .. }) {
@@ -487,4 +471,55 @@ pub fn cmd_params(a: &Args) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Accuracy on school tasks by grade and subject.
+pub struct SchoolReport {
+    /// `(grade, subject) → (tasks, solved, tool calls well-formed)`.
+    pub by: std::collections::BTreeMap<(u8, String), (usize, usize)>,
+    pub steps: usize,
+    pub tasks: usize,
+}
+
+impl std::fmt::Display for SchoolReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (n, ok) = self.by.values().fold((0, 0), |(n, ok), v| (n + v.0, ok + v.1));
+        write!(
+            f,
+            "school test: {:.1}% solved ({ok}/{n}), {:.1} steps per task",
+            100.0 * ok as f64 / n.max(1) as f64,
+            self.steps as f64 / self.tasks.max(1) as f64
+        )?;
+        for ((g, subj), (n, ok)) in &self.by {
+            write!(f, "\n    {g} класс, {subj:<12} {:>5.1}% ({ok}/{n})", 100.0 * *ok as f64 / (*n).max(1) as f64)?;
+        }
+        Ok(())
+    }
+}
+
+/// Runs school test tasks as agent episodes (the agent may think, calculate and look words up)
+/// and checks the answers by the chains' keys.
+pub fn school_eval(
+    policy: &mut dyn Policy,
+    chains: &[cog_engine::dialog::Chain],
+    n: usize,
+    a: &Args,
+) -> Result<SchoolReport> {
+    let mut calc = agent_calculator(a, "rust")?;
+    let (mut browser, origin, _server) = agent_browser(a, "sim")?;
+    let mut rng = cog_engine::kernels::rng::Rng::new(a.num("seed", 1)?);
+    let mut r = SchoolReport { by: Default::default(), steps: 0, tasks: 0 };
+    for _ in 0..n {
+        let c = &chains[rng.below(chains.len())];
+        let goal = Goal { spec: None, text: c.question.clone() };
+        let ep =
+            browsing::run_dialog_episode(browser.as_mut(), policy, calc.as_mut(), &origin, 1, &[], &goal, 6, |_| {})?;
+        let ok = ep.answer.as_deref().is_some_and(|ans| c.accepts(ans));
+        let e = r.by.entry((c.grade, c.subject.clone())).or_default();
+        e.0 += 1;
+        e.1 += ok as usize;
+        r.steps += ep.steps.len();
+        r.tasks += 1;
+    }
+    Ok(r)
 }

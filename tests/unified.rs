@@ -82,3 +82,64 @@ fn observation_keeps_page_history_question_and_tool_result() {
     assert!(bpe.decode(&o).contains("Найти"), "the page is still there: {}", bpe.describe(&o));
     assert_eq!(obs::encode_dialog(&snap, &[], "Привет", None), obs::encode(&snap, "Привет", None));
 }
+
+/// The second observation format: the thinking teacher solves every family with a `THINK`
+/// before each action, and a tiny scratchpad model runs school tasks with the calculator and
+/// the dictionary.
+#[test]
+fn scratchpad_format_thinks_calculates_and_looks_up() -> Result<()> {
+    use cog_engine::browser::agent::ThinkingExpertPolicy;
+    use cog_engine::browser::goal::Split;
+    use cog_engine::browser::obs::{Entry, Layout};
+    use cog_engine::browser::Action;
+    let mut sim = SimBrowser::new();
+    let r = agent::evaluate(&mut sim, &mut ThinkingExpertPolicy, &mut RustCalc, SIM_ORIGIN, 120, 3, Split::Train, 12)?;
+    assert_eq!(r.all.successes, 120, "{r}");
+    // every action follows a THINK
+    let g = Goal {
+        spec: goal::recognize("Сколько стоят вместе лампа и стул?"),
+        text: "Сколько стоят вместе лампа и стул?".into(),
+    };
+    let ep = agent::run_episode(&mut sim, &mut ThinkingExpertPolicy, &mut RustCalc, SIM_ORIGIN, 4, &g, 12, |_| {})?;
+    assert_eq!(ep.success(), Some(true));
+    for pair in ep.steps.chunks(2) {
+        assert!(matches!(pair[0].action, Some(Action::Think { .. })), "{:?}", pair[0].action);
+        assert!(!matches!(pair[1].action, Some(Action::Think { .. })));
+    }
+    let calc = ep.steps.iter().find(|s| matches!(s.action, Some(Action::Calc { .. }))).unwrap();
+    assert!(matches!(calc.added, Some(Entry::Calc(_))));
+    // the scratchpad of a later step holds the thought and the calculator's line
+    let last = ep.steps.last().unwrap();
+    assert!(last.observation.contains(&text::THINK) && last.observation.contains(&text::CALC));
+    assert_eq!(last.observation.len(), Layout::V2.len);
+
+    // a tiny model in the scratchpad format, trained a few steps on built-in data (with a school
+    // chain): its episodes run and its steps have the V2 shapes
+    let mut cfg = UnifiedConfig::preset("tiny2")?;
+    cfg.engine.planner.num_samples = 16;
+    cfg.engine.planner.iterations = 2;
+    let tc = UnifiedTrainConfig { batch_size: 8, steps: 6, warmup: 2, log_every: 3, workers: 2, ..Default::default() };
+    let mut tr = UnifiedTrainer::new(UnifiedModel::new(cfg, &Device::Cpu)?, tc, LanguageData::builtin())?;
+    let mut lines = Vec::new();
+    tr.run_until(6, |l| lines.push(l.to_string()))?;
+    assert!(lines.iter().any(|l| l.contains("school")), "{lines:?}");
+    let mut policy = UnifiedPolicy::new(UnifiedEngine::new(tr.model)?);
+    let g = Goal {
+        spec: None,
+        text: "У Маши было 9 яблок. Маша отдала 4 яблока другу. Сколько яблок осталось?".into(),
+    };
+    let ep = agent::run_episode(&mut sim, &mut policy, &mut RustCalc, SIM_ORIGIN, 1, &g, 3, |_| {})?;
+    assert!(!ep.steps.is_empty());
+    for s in &ep.steps {
+        assert_eq!((s.observation.len(), s.output.len()), (Layout::V2.len, Layout::V2.action_len));
+    }
+    Ok(())
+}
+
+#[test]
+fn dictionary_tool_answers_look_ups() {
+    use cog_engine::tools::dictionary::{Dictionary, NOT_FOUND};
+    let d = Dictionary::from_entries([("книга", "книга — существительное, ж. р.")]);
+    assert_eq!(d.lookup("Книга"), "книга — существительное, ж. р.");
+    assert_eq!(d.lookup("абракадабра"), NOT_FOUND);
+}
